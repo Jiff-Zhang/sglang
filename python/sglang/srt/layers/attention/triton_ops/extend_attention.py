@@ -31,12 +31,66 @@ if is_cuda_available:
 
 is_hip_ = is_hip()
 
+from ..triton_backend import PREFILL_KV_QUANT, BANK_SIZE
+QUANT_NUM_BITS = 8
 
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
+@triton.jit
+def quantize_2d(
+    x,
+    num_bits: tl.constexpr,
+    bank_size: tl.constexpr,
+    dim: tl.constexpr,
+    magic_num: tl.constexpr=1.0
+):
+    if not PREFILL_KV_QUANT:
+        return x
+    
+    # TODO: quant attention weights
+    tl.static_print(num_bits, bank_size, dim, x.shape)
+    # x_p = tl.zeros_like(x)
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+
+    # reshape to bank_size
+    x = tl.reshape(
+        x, 
+        (x.shape[0], x.shape[1] // bank_size, bank_size)
+    )
+    
+    # symmetric quantization
+    max_ranges = tl.max(tl.abs(x), axis=2, keep_dims=True) * magic_num
+    max_int = 2 ** (num_bits - 1) - 1
+    scales = max_ranges / max_int if num_bits > 1 else max_ranges
+    # scales = max_ranges / (max_int + 1) if self.num_bits > 1 else max_ranges
+
+    # set num less than smallest number to smallest number to avoid overflow
+    # smallest_normal = torch.finfo(x.dtype).smallest_normal * max_ranges.clamp(1) 
+    # scales = torch.maximum(scales, smallest_normal)
+    # scales[scales < smallest_normal] = smallest_normal
+    # scales[scales == 0] = 1
+    scales = tl.where(scales == 0, 1, scales)
+    
+    # quant
+    x = tl.clamp(
+        tl.div_rn(x, scales),
+        -max_int if num_bits > 1 else -1,
+        max_int
+    )
+    x = x * scales
+
+    # revert shape
+    x = tl.reshape(x, (x.shape[0], x.shape[1] * x.shape[2]))
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+    # return tl.reshape(x, x_p.shape)
+    return x
 
 @triton.jit
 def _fwd_kernel(
@@ -189,6 +243,8 @@ def _fwd_kernel(
         v = tl.load(
             V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
+        # TODO: quantize p (attention weights)
+        p = quantize_2d(p, num_bits=QUANT_NUM_BITS, bank_size=BANK_SIZE, dim=1)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -263,6 +319,8 @@ def _fwd_kernel(
         v = tl.load(
             V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
+        # TODO: quantize p (attention weights)
+        p = quantize_2d(p, num_bits=QUANT_NUM_BITS, bank_size=BANK_SIZE, dim=1)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
