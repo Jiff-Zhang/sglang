@@ -31,9 +31,6 @@ if is_cuda_available:
 
 is_hip_ = is_hip()
 
-from ..triton_backend import PREFILL_KV_QUANT, BANK_SIZE
-QUANT_NUM_BITS = 8
-
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -47,8 +44,7 @@ def quantize_2d(
     dim: tl.constexpr,
     magic_num: tl.constexpr=1.0
 ):
-    if not PREFILL_KV_QUANT:
-        return x
+    # return x
     
     # TODO: quant attention weights
     tl.static_print(num_bits, bank_size, dim, x.shape)
@@ -244,7 +240,7 @@ def _fwd_kernel(
             V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
         # TODO: quantize p (attention weights)
-        p = quantize_2d(p, num_bits=QUANT_NUM_BITS, bank_size=BANK_SIZE, dim=1)
+        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -320,7 +316,7 @@ def _fwd_kernel(
             V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
         # TODO: quantize p (attention weights)
-        p = quantize_2d(p, num_bits=QUANT_NUM_BITS, bank_size=BANK_SIZE, dim=1)
+        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 

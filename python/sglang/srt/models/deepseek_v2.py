@@ -63,6 +63,9 @@ is_hip_ = is_hip()
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
+MOE_MATMUL = "bf16"
+# MOE_MATMUL = "fp32"
+# MOE_MATMUL = "epsilon"
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -112,7 +115,20 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
+        # TODO: use fp32 matmul or epsilon matmul
+        if MOE_MATMUL == "bf16":
+            logits = F.linear(hidden_states, self.weight, None)
+        elif MOE_MATMUL == "fp32":
+            logits = F.linear(hidden_states.to(torch.float32), self.weight.to(torch.float32), None).to(hidden_states.dtype)
+        elif MOE_MATMUL == "epsilon":
+            import epsilon
+            logits = epsilon.ops.matmul(
+                hidden_states.to(torch.bfloat16).contiguous(),
+                self.weight.T.to(torch.bfloat16).contiguous(),
+                reduce_precision=True, bits=29
+            ).to(hidden_states.dtype)
+        else:
+            raise NotImplementedError(f"Unsupported MOE_MATMUL: {MOE_MATMUL}")
         return logits
 
 

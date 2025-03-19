@@ -38,6 +38,8 @@ def format_example(df, idx, include_answer=True):
 
 
 def gen_prompt(train_df, subject, k=-1):
+    if k == 0:
+        return ""
     prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
         format_subject(subject)
     )
@@ -112,7 +114,6 @@ def main(args):
     #####################################
     ########## SGL Program End ##########
     #####################################
-
     # Select backend
     backend = select_sglang_backend(args)
 
