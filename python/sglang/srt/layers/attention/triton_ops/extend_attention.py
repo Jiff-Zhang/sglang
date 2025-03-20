@@ -42,12 +42,15 @@ def quantize_2d(
     num_bits: tl.constexpr,
     bank_size: tl.constexpr,
     dim: tl.constexpr,
-    magic_num: tl.constexpr=1.0
+    magic_num: tl.constexpr=1.0,
+    active: tl.constexpr=False,
 ):
-    # return x
+    if not active:
+        return x
     
     # TODO: quant attention weights
-    tl.static_print(num_bits, bank_size, dim, x.shape)
+    tl.static_print(active, num_bits, bank_size, dim, x.shape)
+    # tl.device_print('max', tl.max(x))
     # x_p = tl.zeros_like(x)
     
     if dim != 1:
@@ -126,6 +129,7 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
+    ACT_QUANT: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -240,7 +244,7 @@ def _fwd_kernel(
             V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
         # TODO: quantize p (attention weights)
-        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1)
+        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -316,7 +320,7 @@ def _fwd_kernel(
             V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
         # TODO: quantize p (attention weights)
-        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1)
+        p = quantize_2d(p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -358,6 +362,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    act_quant=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -460,6 +465,7 @@ def extend_attention_fwd(
         STORE_TRANSPOSE=is_hip_,
         num_warps=num_warps,
         num_stages=num_stages,
+        ACT_QUANT=act_quant,
         **extra_kargs,
     )
 

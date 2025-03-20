@@ -62,10 +62,36 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
+from sparseopt.attns.act_sparse_nbits import MFSparseNbits
+import math
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
+import torch.distributed as dist
+def debug(*args, **kwargs):
+    # return
+    if dist.get_rank() == 0:
+        print(*args, **kwargs)
+
+def quantize(
+    x: torch.Tensor, # [S, H, D]
+    tool: MFSparseNbits,
+):
+    seq_len = x.size(0)
+    if tool.quant_mode in ["per_group", "per_block"] and tool.bank_size > 0:
+        quant_len = math.floor(seq_len / tool.bank_size) * tool.bank_size
+    else:
+        quant_len = seq_len
+    return torch.cat(
+        [
+            tool(x[:quant_len].transpose(0, -2)).transpose(0, -2),
+            x[quant_len:]
+        ],
+        dim=0
+    )
 
 
 def is_hip() -> bool:

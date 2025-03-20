@@ -22,22 +22,20 @@ import math
 from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever
 # from sparseopt.utils.plot import plot_3d
 
-PREFILL_KV_QUANT = True
+from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+from sglang.srt.utils import quantize, debug
+
+# TODO: To be Deprecated
+# # PREFILL_KV_QUANT = True
 # PREFILL_KV_QUANT = False
 
-DECODE_RETRIEVE = True
+# # DECODE_RETRIEVE = True
 # DECODE_RETRIEVE = False
 
-DECODE_KV_QUANT = True
+# # DECODE_KV_QUANT = True
 # DECODE_KV_QUANT = False
 
-BANK_SIZE = 64
-
-import torch.distributed as dist
-def debug(*args, **kwargs):
-    # return
-    if dist.get_rank() == 0:
-        print(*args, **kwargs)
+# BANK_SIZE = 64
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(
@@ -409,8 +407,10 @@ class TritonAttnBackend(AttentionBackend):
             ],
             dim=0
         )
-    
-    def prefill_quant(
+
+    # TODO: To be Deprecated
+    """
+    def prefill_quant_ori(
         self,
         q: torch.Tensor, #[S, H_q, D_a]
         k: torch.Tensor, # [S, H_k, D_a]
@@ -487,6 +487,50 @@ class TritonAttnBackend(AttentionBackend):
                 v_cache[idx] = self.quantize(v_cache[idx], v_tool, layer)
                 
         return q, k, v, k_cache, v_cache
+    """
+    
+    def prefill_quant(
+        self,
+        q: torch.Tensor, #[S, H_q, D_a]
+        k: torch.Tensor, # [S, H_k, D_a]
+        v: torch.Tensor, # [S, H_k, D_v]
+        qo_indptr: torch.Tensor, # [B]
+        layer: RadixAttention,
+    ):
+        if "prefill_quant" not in getattr(layer, "modes", []):
+            return q, k, v
+        
+        assert hasattr(layer, "q_tool") and \
+            hasattr(layer, "k_tool") and \
+            hasattr(layer, "v_tool"), \
+            f"layer {layer.layer_id} does not have q/k/v tools"
+            
+        q_tool = layer.q_tool
+        k_tool = layer.k_tool
+        v_tool = layer.v_tool
+        # q = q.clone()
+        # k = k.clone()
+        # v = v.clone()
+        for i in range(len(qo_indptr) - 1):
+            idx = torch.arange(qo_indptr[i], qo_indptr[i+1])
+
+            # query/key/value quantization
+            q[idx] = quantize(q[idx], q_tool)
+            k[idx] = quantize(k[idx], k_tool)
+            v[idx] = quantize(v[idx], v_tool)
+            
+        if layer.layer_id == 0:
+            debug(
+                f'#### q/k/v prefill quant ####'
+                f'\n\tquery\t: {q.shape}'
+                f'\n\tkey\t: {k.shape}'
+                f'\n\tvalue\t: {v.shape}'
+                f'\n\tindptr\t: {qo_indptr.shape}'
+                # f'\n\tindptr\t: {qo_indptr}'
+                f'\n\tavg_len\t: {qo_indptr[-1].item() / (len(qo_indptr) - 1):.2f}'
+            )
+
+        return q, k, v
 
     def forward_extend(
         self,
@@ -503,11 +547,6 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
-
         (
             _,
             max_extend_len,
@@ -518,22 +557,44 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr,
         ) = self.forward_metadata
 
+        if save_kv_cache:
+            if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    qo_indptr=qo_indptr,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         
         # TODO: prefill quant q, k, v, k_cache, v_cache
-        if PREFILL_KV_QUANT:
-            q, k, v, k_cache, v_cache = self.prefill_quant(
-                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k=k,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                layer=layer,
-            )
+        # TODO: To be Deprecated
+        # if PREFILL_KV_QUANT:
+        #     q, k, v, k_cache, v_cache = self.prefill_quant_ori(
+        #         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        #         k=k,
+        #         v=v,
+        #         k_cache=k_cache,
+        #         v_cache=v_cache,
+        #         qo_indptr=qo_indptr,
+        #         kv_indptr=kv_indptr,
+        #         kv_indices=kv_indices,
+        #         layer=layer,
+        #     )
+
+        q, k, v = self.prefill_quant(
+            q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k=k,
+            v=v,
+            qo_indptr=qo_indptr,
+            layer=layer,
+        )
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -552,9 +613,12 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
+            act_quant="prefill_quant" in getattr(layer, "modes", []),
         )
         return o
     
+    # TODO: To be Deprecated
+    """
     def fetch_idx_dynamic(
         self,
         q: torch.Tensor, # [B, H_q*D_a]
@@ -607,7 +671,6 @@ class TritonAttnBackend(AttentionBackend):
 
                     # [S, 1, D]
                     k_cache_cur = k_cache[kv_indices[kv_indptr[i]:kv_indptr[i+1]]]
-                    # k_cache_cur = k_cache[kv_indptr[i]:kv_indptr[i+1]] # BUG
                     retriever.update_n(k_cache_cur.transpose(0, 1).unsqueeze(0))
                     # [1, H_q, 1, N] -> [H_q, N]
                     idx = retriever._fetch_idx(q_reverted[i: i+1], None).squeeze(0, 2)
@@ -641,7 +704,81 @@ class TritonAttnBackend(AttentionBackend):
                 # f'\n\tscaling\t: {layer.scaling}'
             )
         return kv_indptr_n, kv_indices_n
+    """
+    
+    def fetch_idx(
+        self,
+        q: torch.Tensor, # [B, H_q*D_a]
+        kv_indptr: torch.Tensor, # [B+1]
+        kv_indices: torch.Tensor, # [S]
+        token_to_kv_pool: MFMLATokenToKVPool,
+        layer: RadixAttention,
+    ):
+        if "retrieve" not in getattr(layer, "modes", []):
+            return kv_indptr, kv_indices
+        
+        assert isinstance(
+            token_to_kv_pool, MFMLATokenToKVPool
+        ), f"token_to_kv_pool must be MFMLATokenToKVPool"
+        assert hasattr(layer, "retriever"), \
+            f"layer {layer.layer_id} does not have retriever"
+            
+        retriever = layer.retriever
+        k_cache = token_to_kv_pool.get_label_buffer(layer.layer_id)
+        if retriever.active:
+            # [B, H_q, 1, D]
+            q_reverted = q.view(q.size(0), -1, 1, layer.qk_head_dim)
+            kv_indptr_n = kv_indptr.clone()
+            kv_indptr_n[0] = 0
+            kv_indices_n = list()
 
+            for i in range(q.size(0)):
+                if kv_indptr[i+1] - kv_indptr[i] > retriever.retain_size:
+                    # reset retriever
+                    retriever._reset()
+
+                    # [S, 1, D]
+                    k_cache_cur = k_cache[kv_indices[kv_indptr[i]:kv_indptr[i+1]]]
+                    
+                    # TODO: set key buffer directly
+                    retriever.key_buffer = k_cache_cur.transpose(0, 1).unsqueeze(0)
+                    retriever.seq_len = len(k_cache_cur)
+                    
+                    # [1, H_q, 1, N] -> [H_q, N]
+                    idx = retriever._fetch_idx(q_reverted[i: i+1], None).squeeze(0, 2)
+                    # TODO: share over head: [H_q, N] -> [N]
+                    idx = idx[0] + kv_indptr[i]
+
+                    # reset retriever
+                    retriever._reset()
+                else:
+                    idx = torch.arange(
+                        kv_indptr[i], kv_indptr[i+1], device=kv_indices.device
+                    )
+                    
+                kv_indptr_n[i+1] = kv_indptr_n[i] + idx.size(-1)
+                kv_indices_n.append(kv_indices.gather(dim=-1, index=idx))
+
+            kv_indices_n = torch.cat(kv_indices_n, dim=-1)
+        else:
+            kv_indptr_n, kv_indices_n = kv_indptr, kv_indices
+        # if layer.layer_id == 0 and dist.get_rank() == 0:
+        #     debug(len(kv_indptr), kv_indices.shape, kv_indptr.max().item(), kv_indices_n.shape, kv_indptr_n.max().item())
+        
+        if layer.layer_id == 0:
+            debug(
+                f'#### kv cache decode retrieve ####'
+                f'\n\tquery\t: {q.shape}'
+                f'\n\tindptr\t: {kv_indptr.shape}'
+                # f'\n\tindptr[0]\t: {kv_indptr[0].item()}'
+                f'\n\tori\t: {kv_indices.shape}, {kv_indptr[-1].item()}, {kv_indptr[-1].item() / (len(kv_indptr) - 1):.2f}'
+                f'\n\tnew\t: {kv_indices_n.shape}, {kv_indptr_n[-1].item()}, {kv_indptr_n[-1].item() / (len(kv_indptr_n) -1):.2f}'
+                # f'\n\tscaling\t: {layer.scaling}'
+            )
+        return kv_indptr_n, kv_indices_n
+
+    # TODO: To be Deprecated
+    """
     def decode_quant(
         self,
         k_cache: torch.Tensor, # [S, H, D_a]
@@ -698,6 +835,7 @@ class TritonAttnBackend(AttentionBackend):
             v_cache[idx] = self.quantize(v_cache[idx], v_tool, layer)
 
         return k_cache, v_cache
+    """
 
     def forward_decode(
         self,
@@ -721,25 +859,41 @@ class TritonAttnBackend(AttentionBackend):
         attn_logits, _, kv_indptr, kv_indices, _, _, _ = self.forward_metadata
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    qo_indptr=None,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
         
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        k_cache_dense = k_cache
 
         # TODO: quant kv cache when decoding
-        if DECODE_KV_QUANT:
-            k_cache, v_cache = self.decode_quant(
-                k_cache, v_cache, kv_indptr, kv_indices, layer,
-            )
+        # TODO: To be Deprecated
+        # k_cache_dense = k_cache
+        # if DECODE_KV_QUANT:
+        #     k_cache, v_cache = self.decode_quant(
+        #         k_cache, v_cache, kv_indptr, kv_indices, layer,
+        #     )
 
         # TODO: double sparse fetch kv from cache
-        if DECODE_RETRIEVE:
-            kv_indptr, kv_indices = self.fetch_idx_dynamic(
-                q, kv_indptr, kv_indices, k_cache_dense, layer,
-            )
+        # TODO: To be Deprecated
+        # if DECODE_RETRIEVE:
+        #     kv_indptr, kv_indices = self.fetch_idx_dynamic(
+        #         q, kv_indptr, kv_indices, k_cache_dense, layer,
+        #     )
+
+        kv_indptr, kv_indices = self.fetch_idx(
+            q, kv_indptr, kv_indices,
+            forward_batch.token_to_kv_pool,
+            layer,
+        )
         
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

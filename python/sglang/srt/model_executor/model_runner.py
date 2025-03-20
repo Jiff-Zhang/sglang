@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    MFMLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -87,6 +88,10 @@ class ModelRunner:
         server_args: ServerArgs,
         is_draft_worker: bool = False,
     ):
+        # TODO: Whether to use Moffett tool
+        # self.is_moffett = False
+        self.is_moffett = True
+        
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -558,6 +563,8 @@ class ModelRunner:
                 * self.model_config.num_hidden_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if self.is_moffett:
+                cell_size *= 2
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -640,7 +647,11 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            self.token_to_kv_pool = MLATokenToKVPool(
+            if self.is_moffett:
+                TokenToKVPoolClass = MFMLATokenToKVPool
+            else:
+                TokenToKVPoolClass = MLATokenToKVPool
+            self.token_to_kv_pool = TokenToKVPoolClass(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,

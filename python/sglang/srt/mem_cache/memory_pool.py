@@ -36,6 +36,8 @@ import torch
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
 
+from sglang.srt.utils import quantize, MFSparseNbits, debug
+
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
@@ -355,6 +357,130 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             self.kv_buffer[layer_id][loc] = cache_k
 
+
+class MFMLATokenToKVPool(MLATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+    ):
+        super().__init__(
+            size, dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver
+        )
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
+        with memory_saver_adapter.region():
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.label_buffer = [
+                torch.empty(
+                    (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
+                    dtype=self.store_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            
+    def get_label_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.label_buffer[layer_id].view(self.dtype)
+        return self.label_buffer[layer_id]
+            
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor=None, # [B]
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+
+        self.label_buffer[layer_id][loc] = cache_k
+        self.kv_buffer[layer_id][loc] = cache_k
+
+        is_decode = qo_indptr is None
+        for i in range(len(kv_indptr) - 1):
+            cur_len = kv_indptr[i + 1] - kv_indptr[i]
+            if is_decode:
+                ori_len = cur_len - 1
+                idx = kv_indices[kv_indptr[i]: kv_indptr[i + 1]]
+            else:
+                ori_len = cur_len
+                cur_len = cur_len + qo_indptr[i + 1] - qo_indptr[i]
+                idx = torch.cat(
+                    [
+                        kv_indices[kv_indptr[i]: kv_indptr[i + 1]],
+                        loc[qo_indptr[i]: qo_indptr[i + 1]]
+                    ],
+                    dim=0
+                )
+            if "retrieve" in getattr(layer, 'modes', []):
+                self.quantize(
+                    self.label_buffer[layer_id], layer.retriever.tool,
+                    idx, ori_len, cur_len, layer
+                )
+            if "cache_quant" in getattr(layer, 'modes', []):
+                self.quantize(
+                    self.kv_buffer[layer_id], layer.k_tool,
+                    idx, ori_len, cur_len, layer
+                )
+                
+        if layer.layer_id == 0:
+            if qo_indptr is None:
+                cur_avg_len = 1
+                avg_len = len(kv_indices) / (len(kv_indptr) - 1)
+            else:
+                cur_avg_len = qo_indptr[-1].item() / (len(qo_indptr) - 1)
+                avg_len = (len(kv_indices) + len(cache_k)) / (len(kv_indptr) - 1)
+            debug(
+                f"#### pool ####",
+                f"\tmode\t: {getattr(layer, 'modes', [])}",
+                f"\tkey\t: {cache_k.shape}",
+                f'\tavg_len\t: {cur_avg_len:.2f}',
+                f"\tindptr\t: {kv_indptr.shape}",
+                f"\tindices\t: {kv_indices.shape}",
+                f"\tavg_len\t: {avg_len:.2f}",
+                sep="\n"
+            )
+
+    def quantize(
+        self, buffer: torch.Tensor, tool: MFSparseNbits,
+        idx: torch.Tensor, ori_len: int, cur_len: int,
+        layer: RadixAttention,
+    ):
+        ori_len_1, cur_len_1 = ori_len, cur_len
+        if tool.quant_mode in ["per_block", "per_group"]:
+            ori_len = ori_len // tool.bank_size * tool.bank_size
+            cur_len = cur_len // tool.bank_size * tool.bank_size
+        ori_data = buffer[idx[ori_len: cur_len]].clone()
+        buffer[idx[ori_len: cur_len]] = quantize(
+            buffer[idx[ori_len: cur_len]], tool
+        )
+        # TODO: To be deprecated
+        # if layer.layer_id == 0:
+        #     debug('\tquant_len', ori_len_1.item(), cur_len_1.item(), ori_len.item(), cur_len.item())
+        #     debug(f"\tidx: {idx}")
+        #     if cur_len > ori_len:
+        #         debug('\tdiff', (ori_data - buffer[idx[ori_len: cur_len]]).abs().mean().item())
 
 class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
     def __init__(

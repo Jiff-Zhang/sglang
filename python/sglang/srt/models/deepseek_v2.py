@@ -58,6 +58,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda_available, is_hip
 
+from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+
 is_hip_ = is_hip()
 
 if is_cuda_available():
@@ -516,9 +518,85 @@ class DeepseekV2AttentionMLA(nn.Module):
             v_head_dim=self.v_head_dim,
         )
 
+        # TODO: register moffett tool
+        self.register_mf_tool(self.attn_mha)
+        self.register_mf_tool(self.attn_mqa)
+
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
+
+    def register_mf_tool(self, layer: RadixAttention):
+        BANK_SIZE = 64
+        modes = [
+            "prefill_quant",
+            "cache_quant",
+            "retrieve"
+        ]
+        
+        from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever
+        q_tool = MFSparseNbits(
+            bank_size=BANK_SIZE,
+            sparsity=0.,
+            quant_mode="per_bank",
+            num_bits={"high": 8, "low": 0},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+        k_tool = MFSparseNbits(
+            bank_size=BANK_SIZE,
+            sparsity=0.,
+            # quant_mode="per_bank",
+            quant_mode="per_block",
+            num_bits={"high": 8, "low": 0},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+        k_cache_tool = k_tool
+        v_tool = MFSparseNbits(
+            bank_size=BANK_SIZE,
+            sparsity=0.,
+            # quant_mode="per_group",
+            quant_mode="per_block",
+            num_bits={"high": 8, "low": 0},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+        v_cache_tool = v_tool
+        retriever = TokenSparseRetriever(
+            active=True,
+            retain_size=2048,
+            # retain_size=5,
+            chunk_size=1,
+            # chunk_size=4,
+            recent_size=40,
+            # recent_size=2,
+            bank_size=BANK_SIZE,
+            sparsity=0.875,
+            sparse_mode="per_bank",
+            # quant_mode="per_token",
+            quant_mode="per_bank",
+            num_bits={"high": 4, "low": 0},
+            # share=False,
+            share=True,
+            share_mode="mean",
+            # share_mode="max",
+            mean_trick=False,
+            # mean_trick=True,
+            # softmax_scale=False,
+            softmax_scale=True,
+            topk_version='v0',
+            all_reduce=True,
+            prefill_chunk=True,
+            qk_scaling=layer.scaling, # TODO: unmark code for scaling
+        )
+        setattr(layer, "q_tool", q_tool)
+        setattr(layer, "k_tool", k_tool)
+        setattr(layer, "v_tool", v_tool)
+        setattr(layer, "k_cache_tool", k_cache_tool)
+        setattr(layer, "v_cache_tool", v_cache_tool)
+        setattr(layer, "retriever", retriever)
+        setattr(layer, "modes", modes)
 
     def forward(
         self,
@@ -536,15 +614,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return self.forward_absorb(positions, hidden_states, forward_batch)
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and forward_batch.extend_prefix_lens.sum() == 0
-            ):
-                return self.forward_normal(positions, hidden_states, forward_batch)
-            else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+            # if (
+            #     forward_batch.forward_mode.is_extend()
+            #     and not forward_batch.forward_mode.is_target_verify()
+            #     and not forward_batch.forward_mode.is_draft_extend()
+            #     and forward_batch.extend_prefix_lens.sum() == 0
+            # ):
+            #     return self.forward_normal(positions, hidden_states, forward_batch)
+            # else:
+            #     return self.forward_absorb(positions, hidden_states, forward_batch)
+            # TODO: use absorb only for moffett support
+            return self.forward_absorb(positions, hidden_states, forward_batch)
 
     def forward_normal(
         self,
