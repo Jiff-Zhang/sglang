@@ -466,9 +466,10 @@ class TritonAttnBackend(AttentionBackend):
                 f'\n\tquery\t: {q.shape}'
                 f'\n\tkey\t: {k.shape}'
                 f'\n\tvalue\t: {v.shape}'
+                f'\n\tavg_len\t: {qo_indptr[-1].item() / (len(qo_indptr) - 1):.2f}'
                 f'\n\tindptr\t: {kv_indptr.shape}'
                 f'\n\tindices\t: {kv_indices.shape}'
-                f'\n\tunique\t: {kv_indices.unique().shape}'
+                # f'\n\tunique\t: {kv_indices.unique().shape}'
                 # f'\n\tk_cache\t: {k_cache.shape}'
                 # f'\n\tv_cache\t: {v_cache.shape}'
                 # f'\n\tqo_indptr\t: {qo_indptr.shape}'
@@ -635,8 +636,8 @@ class TritonAttnBackend(AttentionBackend):
                 f'\n\tquery\t: {q.shape}'
                 f'\n\tindptr\t: {kv_indptr.shape}'
                 # f'\n\tindptr[0]\t: {kv_indptr[0].item()}'
-                f'\n\tori\t: {kv_indices.shape, kv_indptr[-1].item()}'
-                f'\n\tnew\t: {kv_indices_n.shape, kv_indptr_n[-1].item()}'
+                f'\n\tori\t: {kv_indices.shape}, {kv_indptr[-1].item()}, {kv_indptr[-1].item() / (len(kv_indptr) - 1):.2f}'
+                f'\n\tnew\t: {kv_indices_n.shape}, {kv_indptr_n[-1].item()}, {kv_indptr_n[-1].item() / (len(kv_indptr_n) -1):.2f}'
                 # f'\n\tscaling\t: {layer.scaling}'
             )
         return kv_indptr_n, kv_indices_n
@@ -678,7 +679,8 @@ class TritonAttnBackend(AttentionBackend):
                 f'#### kv cache decode quant ####'
                 f'\n\tindptr\t: {kv_indptr.shape}'
                 f'\n\tindices\t: {kv_indices.shape}'
-                f'\n\tunique\t: {kv_indices.unique().shape}'
+                # f'\n\tunique\t: {kv_indices.unique().shape}'
+                f'\n\tavg_len\t: {kv_indptr[-1].item() / (len(kv_indptr) - 1):.2f}'
             )
         for i in range(len(kv_indptr) - 1):
             idx = kv_indices[kv_indptr[i]:kv_indptr[i+1]]
