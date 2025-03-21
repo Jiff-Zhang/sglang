@@ -38,6 +38,8 @@ from sglang.srt.utils import debug_timing, get_compiler_backend
 
 from sglang.srt.utils import quantize, MFSparseNbits, debug
 
+import time
+
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
@@ -417,6 +419,63 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
         self.label_buffer[layer_id][loc] = cache_k
         self.kv_buffer[layer_id][loc] = cache_k
 
+        time_stamp = time.time()
+        if "retrieve" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.label_buffer[layer_id],
+                layer.retriever.tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+                layer=layer,
+            )
+        if "cache_quant" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.kv_buffer[layer_id],
+                layer.k_tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+                layer=layer,
+            )
+                
+        if layer.layer_id == 0:
+            if qo_indptr is None:
+                cur_avg_len = 1
+                avg_len = len(kv_indices) / (len(kv_indptr) - 1)
+            else:
+                cur_avg_len = qo_indptr[-1].item() / (len(qo_indptr) - 1)
+                avg_len = (len(kv_indices) + len(cache_k)) / (len(kv_indptr) - 1)
+            time_used = time.time() - time_stamp
+            total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / len(self.kv_buffer)
+            debug(
+                f"#### pool (time used: {time_used:.3f}s / {total_time_used:.3f}s) ####",
+                f"\tmode\t: {getattr(layer, 'modes', [])}",
+                f"\tkey\t: {cache_k.shape}",
+                f'\tavg_len\t: {cur_avg_len:.2f}',
+                f"\tindptr\t: {kv_indptr.shape}",
+                f"\tindices\t: {kv_indices.shape}",
+                f"\tavg_len\t: {avg_len:.2f}",
+                sep="\n"
+            )
+            self.time_stamp = time.time()
+
+    def quantize(
+        self,
+        buffer: torch.Tensor,
+        tool: MFSparseNbits,
+        loc: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor, # [B]
+        layer: RadixAttention,
+    ):
+        if not tool.is_seq_rely:
+            buffer[loc] = quantize(buffer[loc], tool)
+            return
+            
         is_decode = qo_indptr is None
         for i in range(len(kv_indptr) - 1):
             cur_len = kv_indptr[i + 1] - kv_indptr[i]
@@ -433,54 +492,12 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                     ],
                     dim=0
                 )
-            if "retrieve" in getattr(layer, 'modes', []):
-                self.quantize(
-                    self.label_buffer[layer_id], layer.retriever.tool,
-                    idx, ori_len, cur_len, layer
-                )
-            if "cache_quant" in getattr(layer, 'modes', []):
-                self.quantize(
-                    self.kv_buffer[layer_id], layer.k_tool,
-                    idx, ori_len, cur_len, layer
-                )
-                
-        if layer.layer_id == 0:
-            if qo_indptr is None:
-                cur_avg_len = 1
-                avg_len = len(kv_indices) / (len(kv_indptr) - 1)
-            else:
-                cur_avg_len = qo_indptr[-1].item() / (len(qo_indptr) - 1)
-                avg_len = (len(kv_indices) + len(cache_k)) / (len(kv_indptr) - 1)
-            debug(
-                f"#### pool ####",
-                f"\tmode\t: {getattr(layer, 'modes', [])}",
-                f"\tkey\t: {cache_k.shape}",
-                f'\tavg_len\t: {cur_avg_len:.2f}',
-                f"\tindptr\t: {kv_indptr.shape}",
-                f"\tindices\t: {kv_indices.shape}",
-                f"\tavg_len\t: {avg_len:.2f}",
-                sep="\n"
+        ori_len = ori_len // tool.bank_size * tool.bank_size
+        cur_len = cur_len // tool.bank_size * tool.bank_size
+        if cur_len > ori_len:
+            buffer[idx[ori_len: cur_len]] = quantize(
+                buffer[idx[ori_len: cur_len]], tool
             )
-
-    def quantize(
-        self, buffer: torch.Tensor, tool: MFSparseNbits,
-        idx: torch.Tensor, ori_len: int, cur_len: int,
-        layer: RadixAttention,
-    ):
-        ori_len_1, cur_len_1 = ori_len, cur_len
-        if tool.quant_mode in ["per_block", "per_group"]:
-            ori_len = ori_len // tool.bank_size * tool.bank_size
-            cur_len = cur_len // tool.bank_size * tool.bank_size
-        ori_data = buffer[idx[ori_len: cur_len]].clone()
-        buffer[idx[ori_len: cur_len]] = quantize(
-            buffer[idx[ori_len: cur_len]], tool
-        )
-        # TODO: To be deprecated
-        # if layer.layer_id == 0:
-        #     debug('\tquant_len', ori_len_1.item(), cur_len_1.item(), ori_len.item(), cur_len.item())
-        #     debug(f"\tidx: {idx}")
-        #     if cur_len > ori_len:
-        #         debug('\tdiff', (ori_data - buffer[idx[ori_len: cur_len]]).abs().mean().item())
 
 class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
     def __init__(

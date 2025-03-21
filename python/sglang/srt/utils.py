@@ -80,8 +80,11 @@ def quantize(
     x: torch.Tensor, # [S, H, D]
     tool: MFSparseNbits,
 ):
+    if x.numel() == 0:
+        return x
+    
     seq_len = x.size(0)
-    if tool.quant_mode in ["per_group", "per_block"] and tool.bank_size > 0:
+    if tool.is_seq_rely and tool.bank_size > 0:
         quant_len = math.floor(seq_len / tool.bank_size) * tool.bank_size
     else:
         quant_len = seq_len
