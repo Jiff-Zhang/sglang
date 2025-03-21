@@ -527,7 +527,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_scale = None
 
     def register_mf_tool(self, layer: RadixAttention):
-        BANK_SIZE = 64
+        bank_size = 64
         modes = [
             "prefill_quant",
             "cache_quant",
@@ -536,7 +536,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         
         from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever
         q_tool = MFSparseNbits(
-            bank_size=BANK_SIZE,
+            bank_size=bank_size,
             sparsity=0.,
             quant_mode="per_bank",
             num_bits={"high": 8, "low": 0},
@@ -544,7 +544,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_masked=True,
         )
         k_tool = MFSparseNbits(
-            bank_size=BANK_SIZE,
+            bank_size=bank_size,
             sparsity=0.,
             # quant_mode="per_bank",
             quant_mode="per_block",
@@ -554,7 +554,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         k_cache_tool = k_tool
         v_tool = MFSparseNbits(
-            bank_size=BANK_SIZE,
+            bank_size=bank_size,
             sparsity=0.,
             # quant_mode="per_group",
             quant_mode="per_block",
@@ -571,7 +571,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             # chunk_size=4,
             recent_size=40,
             # recent_size=2,
-            bank_size=BANK_SIZE,
+            bank_size=bank_size,
             sparsity=0.875,
             sparse_mode="per_bank",
             # quant_mode="per_token",

@@ -428,8 +428,8 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
                 qo_indptr=qo_indptr,
-                layer=layer,
             )
+        
         if "cache_quant" in getattr(layer, 'modes', []):
             self.quantize(
                 self.kv_buffer[layer_id],
@@ -438,9 +438,8 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
                 qo_indptr=qo_indptr,
-                layer=layer,
             )
-                
+        
         if layer.layer_id == 0:
             if qo_indptr is None:
                 cur_avg_len = 1
@@ -470,7 +469,6 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
         kv_indptr: torch.Tensor, # [B]
         kv_indices: torch.Tensor, # [S]
         qo_indptr: torch.Tensor, # [B]
-        layer: RadixAttention,
     ):
         if not tool.is_seq_rely:
             buffer[loc] = quantize(buffer[loc], tool)
