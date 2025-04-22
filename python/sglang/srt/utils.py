@@ -76,6 +76,10 @@ def debug(*args, **kwargs):
     if dist.get_rank() == 0:
         print(*args, **kwargs)
 
+def check(x: torch.Tensor):
+    assert not x.isinf().any(), f"x exists inf: {x}"
+    assert not x.isnan().any(), f"x exists nan: {x}"
+
 def quantize(
     x: torch.Tensor, # [S, H, D]
     tool: MFSparseNbits,

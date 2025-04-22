@@ -22,9 +22,13 @@ node_rank=$1 && shift
 # model_path=/ssd01/models/DeepSeek-R1/
 dist_init_addr="172.31.0.3:1234"
 
-export GLOO_SOCKET_IFNAME=eth0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=1
+export GLOO_SOCKET_IFNAME=eth0 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    CUDA_LAUNCH_BLOCKING=1 \
+    # TORCH_USE_CUDA_DSA=True \
+    # TRITON_DEBUG=True
 
-python -m sglang.launch_server \
+python -u -m sglang.launch_server \
     --model-path $model_path \
     --tp 16 \
     --dist-init-addr $dist_init_addr \
@@ -34,5 +38,7 @@ python -m sglang.launch_server \
     --disable-cuda-graph \
     --disable-radix-cache \
     --enable-cache-report \
+    --chunked-prefill-size 2048 \
+    $* \
+    # --mem-fraction-static 0.7 \
     # --watchdog-timeout 360000 \
-    # --chunked-prefill-size 256 \

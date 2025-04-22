@@ -484,6 +484,28 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr=qo_indptr,
             layer=layer,
         )
+        # TODO: only for saving kv cache for XAttention
+        # if True:
+        #     import torch.distributed as dist
+        #     if dist.get_rank() == 0:
+        #         print(layer.layer_id, len(qo_indptr), len(kv_indices))
+        #         if len(qo_indptr) == 2 and len(kv_indices) > 1e5:
+        #             import os
+        #             data_dir = "/ssd01/workspace/sglang/exp/data/kv_cache"
+        #             os.makedirs(data_dir, exist_ok=True)
+        #             filepath = os.path.join(data_dir, f"{layer.layer_id:02d}.pth")
+        #             print(f'saving data to {filepath}')
+        #             torch.save(
+        #                 {
+        #                     "k_cache": k_cache[kv_indices].cpu(),
+        #                     "k": k.cpu(),
+        #                     "q": q.cpu(),
+        #                     "scaling": layer.scaling,
+        #                 },
+        #                 filepath
+        #             )
+        #             if layer.layer_id == 60:
+        #                 import sys; sys.exit()
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -503,8 +525,20 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             act_quant="prefill_quant" in getattr(layer, "modes", []),
+            verbose=(layer.layer_id == 0),
         )
+        # TODO: only for debugging, masked partial head of output
+        # self.output_masked(o, layer)
         return o
+
+    def output_masked(self, o: torch.Tensor, layer: RadixAttention):
+        # set partial head to zero:
+        import torch.distributed as dist
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # print(dist.get_rank(), o.shape, o.dtype, get_tensor_model_parallel_rank())
+        if layer.layer_id == 60 and get_tensor_model_parallel_rank() == 0:
+            # o[:, 5*layer.v_head_dim: 6*layer.v_head_dim] = 0
+            o[:, 6*layer.v_head_dim: 7*layer.v_head_dim] = 0
     
     def fetch_idx(
         self,
@@ -552,7 +586,10 @@ class TritonAttnBackend(AttentionBackend):
             # [MB, H_k, maxlen, D], left paddding
             select_k_cache = torch.stack(
                 [
-                    F.pad(k, (0, 0, 0, 0, maxlen - len(k), 0))
+                    F.pad(
+                        k, (0, 0, 0, 0, maxlen - len(k), 0),
+                        mode="constant", value=0
+                    )
                     for k, pad_len in zip(select_k_cache, pad_info)
                 ],
                 dim=0
@@ -570,6 +607,7 @@ class TritonAttnBackend(AttentionBackend):
             idx = retriever._fetch_idx(select_q_reverted, mask).squeeze(2)[:, 0]
             # remove offset introduced by padding
             idx = idx - pad_info[:, None]
+            assert idx.min() >= 0, "idx should be non-negative"
             
             kv_indices_n = [
                 kv_indices[kv_indptr[i]: kv_indptr[i+1]] if i not in seq_idx \
@@ -664,6 +702,8 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
         )
+        # TODO: only for debugging, masked partial head of output
+        # self.output_masked(o, layer)
         return o
 
 

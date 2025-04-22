@@ -19,11 +19,12 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 import torch
 import triton
 import triton.language as tl
+from einops import rearrange
 
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, debug, check
 
 is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
@@ -96,6 +97,7 @@ def _fwd_kernel(
     Q_Extend,
     K_Extend,
     V_Extend,
+    QK_Extend,
     O_Extend,
     K_Buffer,
     V_Buffer,
@@ -112,6 +114,9 @@ def _fwd_kernel(
     stride_kh,
     stride_vbs,
     stride_vh,
+    stride_qkbs,
+    stride_qkh,
+    stride_qkq,
     stride_obs,
     stride_oh,
     stride_buf_kbs,
@@ -130,6 +135,10 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     ACT_QUANT: tl.constexpr,
+    SAVE_QK: tl.constexpr,
+    USE_QK_MASKED: tl.constexpr,
+    VERBOSE: tl.constexpr,
+    MAX_IDX: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -230,6 +239,32 @@ def _fwd_kernel(
         else:
             qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
+        # TODO: save qk
+        offs_qk = (
+            cur_seq * stride_qkbs
+            + cur_head * stride_qkh
+            + (cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qkq
+            + (start_n + offs_n[None, :])
+        )
+        # DEBUG
+        # if tl.min(offs_qk) < 0:
+        #     tl.device_print('offset-prefill-min-overflow', tl.min(offs_qk))
+        if tl.max(offs_qk) >= MAX_IDX:
+            tl.device_print('offset-prefill-max-overflow', tl.max(offs_qk))
+        if SAVE_QK:
+            tl.store(
+                QK_Extend + offs_qk,
+                qk,
+                mask=(mask_m[:, None] & mask_n[None, :]),
+            )
+        elif USE_QK_MASKED:
+            qk_mask = tl.load(
+                QK_Extend + offs_qk,
+                mask=(mask_m[:, None] & mask_n[None, :]),
+            )
+            # qk = tl.where(qk_mask != float("-inf"), qk, float("-inf"))
+            qk = tl.where(qk_mask != float("-inf"), qk, -2 ** 50)
+
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max[:, None])
@@ -305,6 +340,32 @@ def _fwd_kernel(
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
+            
+        # TODO: save qk
+        offs_qk = (
+            cur_seq * stride_qkbs
+            + cur_head * stride_qkh
+            + (cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qkq
+            + (cur_seq_len_prefix + start_n + offs_n[None, :])
+        )
+        # DEBUG
+        # if tl.min(offs_qk) < 0:
+        #     tl.device_print('offset-extend-min-overflow', tl.min(offs_qk))
+        if tl.max(offs_qk) >= MAX_IDX:
+            tl.device_print('offset-extend-max-overflow', tl.max(offs_qk))
+        if SAVE_QK:
+            tl.store(
+                QK_Extend + offs_qk,
+                qk,
+                mask=(mask_m[:, None] & mask_n[None, :]),
+            )
+        elif USE_QK_MASKED:
+            qk_mask = tl.load(
+                QK_Extend + offs_qk,
+                mask=(mask_m[:, None] & mask_n[None, :]),
+            )
+            # qk = tl.where(qk_mask != float("-inf"), qk, float("-inf"))
+            qk = tl.where(qk_mask != float("-inf"), qk, -2 ** 50)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -345,17 +406,16 @@ def _fwd_kernel(
             mask=mask_m[:, None] & mask_dv[None, :],
         )
 
-
 def extend_attention_fwd(
-    q_extend,
-    k_extend,
-    v_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
+    q_extend, # [Le, Hq, Da]
+    k_extend, # [Le, Hk, Da]
+    v_extend, # [Le, Hk, Dv]
+    o_extend, # [Le, Hk, Dv]
+    k_buffer, # [Bf, Hk, Da]
+    v_buffer, # [Bf, Hk, Dv]
+    qo_indptr, # [B + 1]
+    kv_indptr, # [B + 1]
+    kv_indices, # [Lp]
     custom_mask,
     mask_indptr,
     max_len_extend,
@@ -363,6 +423,8 @@ def extend_attention_fwd(
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
     act_quant=False,
+    x_attn=False,
+    verbose=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -426,49 +488,209 @@ def extend_attention_fwd(
     if is_hip_:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _fwd_kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        sm_scale,
-        kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        logit_cap=logit_cap,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=is_hip_,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        ACT_QUANT=act_quant,
-        **extra_kargs,
-    )
+    # debug(
+    #     q_extend.shape, k_extend.shape, v_extend.shape, o_extend.shape, k_buffer.shape, v_buffer.shape, grid, mask_indptr, custom_mask
+    # )
 
+    x_attn = True
+    if x_attn:
+        # [B]
+        len_extend = qo_indptr[1:] - qo_indptr[:-1]
+        len_prefix = kv_indptr[1:] - kv_indptr[:-1]
+        # # [B]
+        # num_attn_nodes = len_extend * (len_extend + len_prefix) * head_num
+        # debug(num_attn_nodes)
+        # # [1]
+        # num_attn_nodes = num_attn_nodes.to(torch.int64).sum()
+        # debug(num_attn_nodes)
+        qk_extend = o_extend.new_ones(
+            (
+                batch_size,  head_num,
+                triton.cdiv(max_len_extend, BLOCK_M) * BLOCK_M,
+                triton.cdiv((len_prefix + len_extend).max(), BLOCK_N) * BLOCK_N
+            )
+        ) * float("-inf")
+        qk_extend = qk_extend.contiguous()
+        if verbose:
+            debug('qk_extend', qk_extend.shape, qk_extend.numel(), qk_extend.device, qk_extend.dtype)
+        stage_kwargs_list = [
+            {
+                "SAVE_QK": True,
+                "USE_QK_MASKED": False,
+            },
+            {
+                "SAVE_QK": False,
+                "USE_QK_MASKED": True,
+            }
+        ]
+    else:
+        qk_extend = None
+        stage_kwargs_list = [
+            {
+                "SAVE_QK": False,
+                "USE_QK_MASKED": False,
+            }
+        ]
+
+    import torch.distributed as dist
+    for stage_kwargs in stage_kwargs_list:
+        _fwd_kernel[grid](
+            q_extend,
+            k_extend,
+            v_extend,
+            qk_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
+            sm_scale,
+            kv_group_num,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            qk_extend.stride(0) if qk_extend is not None else 0,
+            qk_extend.stride(1) if qk_extend is not None else 0,
+            qk_extend.stride(2) if qk_extend is not None else 0,
+            o_extend.stride(0),
+            o_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            logit_cap=logit_cap,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            Lq=Lq,
+            Lv=Lv,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+            STORE_TRANSPOSE=is_hip_,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            ACT_QUANT=act_quant,
+            # SAVE_QK=save_qk,
+            # USE_QK_MASKED=use_qk_masked,
+            **stage_kwargs,
+            # VERBOSE=verbose and dist.get_rank() == 0,
+            VERBOSE=False,
+            MAX_IDX=qk_extend.numel() if qk_extend is not None else float("inf"),
+            **extra_kargs,
+        )
+        if x_attn and stage_kwargs["SAVE_QK"]:
+            if verbose:
+                debug('before', (qk_extend != float("-inf")).float().mean().item())
+            try:
+                qk_extend = adjust_x_attn_qk(
+                    qk_extend, stride=8, block=16, threshold=0.9, verbose=verbose
+                )
+            except torch.OutOfMemoryError as e:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                qk_extend = adjust_x_attn_qk(
+                    qk_extend, stride=8, block=16, threshold=0.9, verbose=verbose
+                )
+            if verbose:
+                debug('after', (qk_extend != float("-inf")).float().mean().item())
+    # if verbose:
+    #     debug(qk_extend)
+    check(o_extend)
+
+def adjust_x_attn_qk(
+    qk_extend: torch.Tensor, # [B, H, Q, K]
+    stride=8,
+    block=16,
+    threshold=0.9,
+    verbose=False,
+):
+    assert block % stride == 0, f"block: {block}, stride: {stride}"
+    B, H, Q, K = qk_extend.shape
+    Q_A = Q // block * block
+    K_A = K // block * block
+
+    # [B, H, Q_A, K_A] -> [B, H, qns, kns, q_s, k_s]
+    folded_qk = rearrange(
+        qk_extend[:, :, :Q_A, :K_A],
+        "b h (qns q_s) (kns k_s) -> b h qns kns q_s k_s",
+        q_s=stride,
+        k_s=stride,
+    )
+    # flip k_s
+    folded_qk = folded_qk.flip(dims=[-1])
+    # calculate diagonal mean
+    # [B, H, qns, kns, q_s, k_s]
+    mask = torch.logical_and(
+        torch.eye(stride, device=qk_extend.device, dtype=torch.bool),
+        folded_qk != float("-inf")
+    )
+    # [B, H, qns, kns]
+    num_nonzero = mask.to(folded_qk.dtype).sum(dim=-1).sum(dim=-1)
+    # [B, H, qns, kns, q_s, k_s] -> [B, H, qns, kns]
+    mean_qk = torch.where(mask, folded_qk, 0).sum(dim=-1).sum(dim=-1) / \
+        num_nonzero.clamp(min=1)
+    # might cause nan when all elements are -inf
+    # mean_qk = torch.where(num_nonzero != 0, mean_qk, float("-inf"))
+    mean_qk = torch.where(num_nonzero != 0, mean_qk, torch.finfo(mean_qk.dtype).min)
+    # if verbose:
+    #     debug("sum", torch.where(mask, folded_qk, 0).sum(dim=-1).sum(dim=-1), "num", mask.sum(dim=-1).sum(dim=-1).clamp(min=1), mask.shape, folded_qk.shape)
+
+    # [B, H, qns, kns] -> [B, H, qnb, knb*q_s_b*k_s_b]
+    mean_qk = rearrange(
+        mean_qk,
+        "b h (qnb q_s_b) (knb k_s_b) -> b h qnb (knb q_s_b k_s_b)",
+        q_s_b=block // stride,
+        k_s_b=block // stride,
+    )
+    # [B, H, qnb, knb*q_s_b*k_s_b] -> [B, H, qnb, knb]
+    scores = rearrange(
+        mean_qk.softmax(dim=-1),
+        "b h qnb (knb q_s_b k_s_b) -> b h qnb knb (q_s_b k_s_b)",
+        q_s_b=block // stride,
+        k_s_b=block // stride,
+    ).sum(dim=-1)
+    # sort
+    sort_scores, sort_idx = torch.sort(scores, dim=-1, descending=True)
+    cum_scores = torch.cumsum(sort_scores, dim=-1)
+    # [B, H, qnb, knb] -> [B, H, qnb]
+    retain_len = ((cum_scores < threshold).int().sum(dim=-1) + 1).clamp(max=scores.size(-1))
+    # [knb]
+    range_block = torch.arange(sort_idx.size(-1), device=retain_len.device)
+    # [B, H, qnb, knb]
+    mask = range_block[None, None, None, :] < retain_len[..., None]
+    sort_idx = torch.where(mask, sort_idx, sort_idx[..., :1].repeat(1, 1, 1, sort_idx.size(-1)))
+    mask.zero_()
+    mask.scatter_(dim=-1, index=sort_idx, value=True)
+    # if verbose:
+    #     debug(retain_len, 'scores', scores, 'mean', mean_qk) #, 'softmax', mean_qk.softmax(dim=-1), 'fold', folded_qk)
+    #     debug(mask.int().sum(-1) == retain_len)
+    
+    # [B, H, Q_A, K_A] -> [B, H, qnb, knb, q_b, k_b]
+    folded_qk = rearrange(
+        qk_extend[:, :, :Q_A, :K_A],
+        "b h (qnb q_b) (knb k_b) -> b h qnb knb q_b k_b",
+        q_b=block,
+        k_b=block,
+    )
+    folded_qk = torch.where(mask[..., None, None], folded_qk, float("-inf"))
+    # revert [B, H, qnb, knb, q_b, k_b] -> [B, H, Q_A, K_A]
+    qk_extend[:, :, :Q_A, :K_A] = rearrange(
+        folded_qk,
+        "b h qnb knb q_b k_b -> b h (qnb q_b) (knb k_b)",
+    )
+    
+    # if verbose:
+    #     debug(Q_A, K_A, mean_qk.shape, scores.shape, retain_len.float().mean() / scores.size(-1), mask.float().mean())
+    
+    return qk_extend
 
 def redundant_attention(
     q_extend,

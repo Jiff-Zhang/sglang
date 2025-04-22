@@ -529,9 +529,9 @@ class DeepseekV2AttentionMLA(nn.Module):
     def register_mf_tool(self, layer: RadixAttention):
         bank_size = 64
         modes = [
-            "prefill_quant",
-            "cache_quant",
-            "retrieve"
+            # "prefill_quant",
+            # "cache_quant",
+            # "retrieve"
         ]
         
         from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever
@@ -566,6 +566,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         retriever = TokenSparseRetriever(
             active=True,
             retain_size=2048,
+            # retain_size=128,
+            # retain_size=256,
             # retain_size=5,
             chunk_size=1,
             # chunk_size=4,
