@@ -25,6 +25,7 @@ dist_init_addr="172.31.0.3:1234"
 export GLOO_SOCKET_IFNAME=eth0 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     CUDA_LAUNCH_BLOCKING=1 \
+    TRITON_CACHE_DIR=~/workspace/sglang/triton-cache/tmp \
     # TORCH_USE_CUDA_DSA=True \
     # TRITON_DEBUG=True
 
@@ -39,6 +40,7 @@ python -u -m sglang.launch_server \
     --disable-radix-cache \
     --enable-cache-report \
     --chunked-prefill-size 2048 \
+    --mem-fraction-static 0.7 \
     $* \
-    # --mem-fraction-static 0.7 \
+    # --mem-fraction-static 0.6 \
     # --watchdog-timeout 360000 \

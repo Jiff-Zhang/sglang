@@ -525,6 +525,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             act_quant="prefill_quant" in getattr(layer, "modes", []),
+            x_attn="prefill_x_attn" in getattr(layer, "modes", []),
             verbose=(layer.layer_id == 0),
         )
         # TODO: only for debugging, masked partial head of output

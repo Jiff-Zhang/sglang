@@ -529,9 +529,12 @@ class DeepseekV2AttentionMLA(nn.Module):
     def register_mf_tool(self, layer: RadixAttention):
         bank_size = 64
         modes = [
-            # "prefill_quant",
-            # "cache_quant",
-            # "retrieve"
+            # "prefill_quant",    # whether to quantize key/value/query/score when prefill
+            # "cache_quant",      # whether to quantize cached key & value
+            
+            "prefill_x_attn",   # whether to mask partial score when prefill
+            
+            # "retrieve",         # whether to quantize cached key and retrieve tokens when decode
         ]
         
         from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever

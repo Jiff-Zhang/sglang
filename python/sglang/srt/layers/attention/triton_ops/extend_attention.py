@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
+import math
 
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
@@ -50,7 +51,7 @@ def quantize_2d(
         return x
     
     # TODO: quant attention weights
-    tl.static_print(active, num_bits, bank_size, dim, x.shape)
+    # tl.static_print(active, num_bits, bank_size, dim, x.shape)
     # tl.device_print('max', tl.max(x))
     # x_p = tl.zeros_like(x)
     
@@ -254,7 +255,8 @@ def _fwd_kernel(
         if SAVE_QK:
             tl.store(
                 QK_Extend + offs_qk,
-                qk,
+                # qk,
+                tl.cast(qk, tl.bfloat16),
                 mask=(mask_m[:, None] & mask_n[None, :]),
             )
         elif USE_QK_MASKED:
@@ -262,6 +264,7 @@ def _fwd_kernel(
                 QK_Extend + offs_qk,
                 mask=(mask_m[:, None] & mask_n[None, :]),
             )
+            # might cause nan when all qk is -inf
             # qk = tl.where(qk_mask != float("-inf"), qk, float("-inf"))
             qk = tl.where(qk_mask != float("-inf"), qk, -2 ** 50)
 
@@ -356,7 +359,8 @@ def _fwd_kernel(
         if SAVE_QK:
             tl.store(
                 QK_Extend + offs_qk,
-                qk,
+                # qk,
+                tl.cast(qk, tl.bfloat16),
                 mask=(mask_m[:, None] & mask_n[None, :]),
             )
         elif USE_QK_MASKED:
@@ -364,6 +368,7 @@ def _fwd_kernel(
                 QK_Extend + offs_qk,
                 mask=(mask_m[:, None] & mask_n[None, :]),
             )
+            # might cause nan when all qk is -inf
             # qk = tl.where(qk_mask != float("-inf"), qk, float("-inf"))
             qk = tl.where(qk_mask != float("-inf"), qk, -2 ** 50)
 
@@ -492,7 +497,6 @@ def extend_attention_fwd(
     #     q_extend.shape, k_extend.shape, v_extend.shape, o_extend.shape, k_buffer.shape, v_buffer.shape, grid, mask_indptr, custom_mask
     # )
 
-    x_attn = True
     if x_attn:
         # [B]
         len_extend = qo_indptr[1:] - qo_indptr[:-1]
@@ -507,7 +511,7 @@ def extend_attention_fwd(
             (
                 batch_size,  head_num,
                 triton.cdiv(max_len_extend, BLOCK_M) * BLOCK_M,
-                triton.cdiv((len_prefix + len_extend).max(), BLOCK_N) * BLOCK_N
+                (triton.cdiv(len_prefix.max(), BLOCK_N) + triton.cdiv(len_extend.max(), BLOCK_N)) * BLOCK_N
             )
         ) * float("-inf")
         qk_extend = qk_extend.contiguous()
@@ -589,30 +593,58 @@ def extend_attention_fwd(
         if x_attn and stage_kwargs["SAVE_QK"]:
             if verbose:
                 debug('before', (qk_extend != float("-inf")).float().mean().item())
+                # debug(qk_extend)
+                # import time; time.sleep(1)
+            stride, block = 1, 1
+            stride, block = 4, 4
+            stride, block = 8, 8
+            stride, block = 8, 64
+            threshold = 0.9
+            threshold = 0.95
+            threshold = 0.98
+            threshold = None
+            len_ratio = 0.2
+            len_ratio = 0.25
+            len_ratio = 0.5
+            # len_ratio = None
             try:
                 qk_extend = adjust_x_attn_qk(
-                    qk_extend, stride=8, block=16, threshold=0.9, verbose=verbose
+                    qk_extend, 
+                    stride=stride,
+                    block=block,
+                    threshold=threshold,
+                    len_ratio=len_ratio,
+                    verbose=verbose
                 )
             except torch.OutOfMemoryError as e:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 qk_extend = adjust_x_attn_qk(
-                    qk_extend, stride=8, block=16, threshold=0.9, verbose=verbose
+                    qk_extend, 
+                    stride=stride,
+                    block=block,
+                    threshold=threshold,
+                    len_ratio=len_ratio,
+                    verbose=verbose
                 )
             if verbose:
                 debug('after', (qk_extend != float("-inf")).float().mean().item())
-    # if verbose:
-    #     debug(qk_extend)
-    check(o_extend)
+    # check(o_extend)
 
 def adjust_x_attn_qk(
     qk_extend: torch.Tensor, # [B, H, Q, K]
     stride=8,
     block=16,
     threshold=0.9,
+    len_ratio=None,
     verbose=False,
 ):
+    # running on cpu
+    # device = qk_extend.device
+    # qk_extend = qk_extend.to('cpu')
+    
     assert block % stride == 0, f"block: {block}, stride: {stride}"
+    assert (threshold and not len_ratio) or (not threshold and len_ratio), f"Conflict threshold: {threshold}, len_ratio: {len_ratio}"
     B, H, Q, K = qk_extend.shape
     Q_A = Q // block * block
     K_A = K // block * block
@@ -643,6 +675,8 @@ def adjust_x_attn_qk(
     # if verbose:
     #     debug("sum", torch.where(mask, folded_qk, 0).sum(dim=-1).sum(dim=-1), "num", mask.sum(dim=-1).sum(dim=-1).clamp(min=1), mask.shape, folded_qk.shape)
 
+    """
+    # wrong implementation
     # [B, H, qns, kns] -> [B, H, qnb, knb*q_s_b*k_s_b]
     mean_qk = rearrange(
         mean_qk,
@@ -657,11 +691,60 @@ def adjust_x_attn_qk(
         q_s_b=block // stride,
         k_s_b=block // stride,
     ).sum(dim=-1)
+    """
+
+    # [B, H, qns, kns]
+    scores = mean_qk.softmax(dim=-1)
+    # if verbose:
+    #     debug('score', mean_qk, scores)
+    # [B, H, qns, kns] -> [B, H, qnb, knb, q_s_b*k_s_b] -> [B, H, qnb, knb]
+    scores = rearrange(
+        scores,
+        "b h (qnb q_s_b) (knb k_s_b) -> b h qnb knb (q_s_b k_s_b)",
+        q_s_b=block // stride,
+        k_s_b=block // stride,
+    ).sum(dim=-1)
+    
     # sort
     sort_scores, sort_idx = torch.sort(scores, dim=-1, descending=True)
     cum_scores = torch.cumsum(sort_scores, dim=-1)
-    # [B, H, qnb, knb] -> [B, H, qnb]
-    retain_len = ((cum_scores < threshold).int().sum(dim=-1) + 1).clamp(max=scores.size(-1))
+    # if verbose:
+    #     debug(cum_scores, cum_scores[..., -1:])
+    if threshold:
+        # [B, H, qnb, knb] -> [B, H, qnb]
+        retain_len = (
+            (cum_scores < threshold * cum_scores[..., -1:]).int().sum(dim=-1) + 1
+        ).clamp(max=scores.size(-1))
+    else:
+        # [B, H, qns, kns]  -> [B, H, qnb, knb]
+        blocks_num_nonzero = rearrange(
+            num_nonzero,
+            "b h (qnb q_s_b) (knb k_s_b) -> b h qnb knb (q_s_b k_s_b)",
+            q_s_b=block // stride,
+            k_s_b=block // stride,
+        ).sum(dim=-1)
+        # [B, H, qnb, knb] -> [B, H, qnb]
+        num_blocks = (blocks_num_nonzero > 0).int().sum(dim=-1)
+        retain_len = (num_blocks.float() * len_ratio).ceil().int()
+        if verbose:
+            debug(num_blocks.size(), num_blocks, retain_len)
+            # if retain_len[:, -1].sum() == 0:
+            #     import torch.distributed as dist
+            #     if dist.get_rank() == 0:
+            #         info = {
+            #             "qk_extend": qk_extend.cpu(),
+            #             "num_nonzero": num_nonzero.cpu(),
+            #             "blocks_num_nonzero": blocks_num_nonzero.cpu(),
+            #             "scores": scores.cpu(),
+            #             "mean_qk": mean_qk.cpu(),
+            #             "retain_len": retain_len.cpu(),
+            #         }
+            #         torch.save(info, '/ssd01/workspace/sglang/debug.pt')
+            #         raise Exception('hihi')
+        
+        # retain_len = torch.ones(
+        #     cum_scores.shape[:-1], dtype=torch.int, device=cum_scores.device
+        # ) * math.ceil(len_ratio * scores.size(-1))
     # [knb]
     range_block = torch.arange(sort_idx.size(-1), device=retain_len.device)
     # [B, H, qnb, knb]
@@ -672,6 +755,8 @@ def adjust_x_attn_qk(
     # if verbose:
     #     debug(retain_len, 'scores', scores, 'mean', mean_qk) #, 'softmax', mean_qk.softmax(dim=-1), 'fold', folded_qk)
     #     debug(mask.int().sum(-1) == retain_len)
+    # if verbose:
+    #     debug(sort_idx[..., :retain_len.max()])
     
     # [B, H, Q_A, K_A] -> [B, H, qnb, knb, q_b, k_b]
     folded_qk = rearrange(
@@ -680,6 +765,7 @@ def adjust_x_attn_qk(
         q_b=block,
         k_b=block,
     )
+    # mask qk_extend to -inf representing deprecated blocks
     folded_qk = torch.where(mask[..., None, None], folded_qk, float("-inf"))
     # revert [B, H, qnb, knb, q_b, k_b] -> [B, H, Q_A, K_A]
     qk_extend[:, :, :Q_A, :K_A] = rearrange(
@@ -689,7 +775,9 @@ def adjust_x_attn_qk(
     
     # if verbose:
     #     debug(Q_A, K_A, mean_qk.shape, scores.shape, retain_len.float().mean() / scores.size(-1), mask.float().mean())
-    
+
+    # covert to original device
+    # qk_extend = qk_extend.to(device)
     return qk_extend
 
 def redundant_attention(
