@@ -557,6 +557,8 @@ class TritonAttnBackend(AttentionBackend):
         ), f"token_to_kv_pool must be MFMLATokenToKVPool"
         assert hasattr(layer, "retriever"), \
             f"layer {layer.layer_id} does not have retriever"
+        assert hasattr(layer, "retrieve_q_tool"), \
+            f"layer {layer.layer_id} does not have retrieve_q_tool"
 
         time_stamp = time.time()
         retriever = layer.retriever
@@ -577,6 +579,25 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # [MB, H_q, 1, D]
             select_q_reverted = q_reverted[seq_idx]
+
+            # TODO: To be deleted, save select_q_reverted
+            '''
+            import torch.distributed as dist
+            if dist.get_rank() == 0 and layer.layer_id == 0:
+                if not hasattr(self, "q_buffer"):
+                    self.q_buffer = []
+                if len(kv_indices) > 1e4:
+                    self.q_buffer.append(select_q_reverted.detach().cpu())
+                print(len(self.q_buffer), '$$$$$$$$$$$$$$$$$$$$$')
+                if len(self.q_buffer) >= 128:
+                    os.makedirs('/ssd01/workspace/sglang/exp/data/query', exist_ok=True)
+                    torch.save(
+                        torch.cat(self.q_buffer, dim=2),
+                        f"/ssd01/workspace/sglang/exp/data/query/layer0.pt"
+                    )
+                    import sys; sys.exit(-1)
+            '''
+            
             select_k_cache = [
                 k_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]]
                 for i in seq_idx
@@ -605,7 +626,10 @@ class TritonAttnBackend(AttentionBackend):
             retriever.key_buffer = select_k_cache
             retriever.seq_len = maxlen
             # [MB, H_k, 1, N] -> [MB, HK, N] -> [MB, N]
-            idx = retriever._fetch_idx(select_q_reverted, mask).squeeze(2)[:, 0]
+            idx = retriever._fetch_idx(
+                layer.retrieve_q_tool(select_q_reverted),
+                mask
+            ).squeeze(2)[:, 0]
             # remove offset introduced by padding
             idx = idx - pad_info[:, None]
             assert idx.min() >= 0, "idx should be non-negative"

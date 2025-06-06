@@ -31,16 +31,16 @@ export GLOO_SOCKET_IFNAME=eth0 \
 
 python -u -m sglang.launch_server \
     --model-path $model_path \
-    --tp 16 \
+    --tp 1 \
     --dist-init-addr $dist_init_addr \
-    --nnodes 2 \
+    --nnodes 1 \
     --node-rank ${node_rank} \
     --trust-remote-code \
     --disable-cuda-graph \
     --disable-radix-cache \
     --enable-cache-report \
-    --chunked-prefill-size 2048 \
-    --mem-fraction-static 0.7 \
     $* \
+    # --chunked-prefill-size 2048 \
+    # --mem-fraction-static 0.7 \
     # --mem-fraction-static 0.6 \
     # --watchdog-timeout 360000 \

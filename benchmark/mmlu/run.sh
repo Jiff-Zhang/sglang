@@ -10,6 +10,11 @@
 # ***********************************************
 
 set -e
-# bash $(dirname $0)/download_data.sh
-python3 $(dirname $0)/bench_sglang.py --nsub 100 --ntrain 5 --parallel 2000
-# python3 $(dirname $0)/bench_sglang.py --nsub 1 --ntrain 0 # --parallel 2000
+
+cd $(dirname $0)
+
+# bash download_data.sh
+python3 bench_sglang.py --nsub 100 --ntrain 5 --parallel 2000 $*
+# python3 bench_sglang.py --nsub 1 --ntrain 0 # --parallel 2000 $*
+
+cd -

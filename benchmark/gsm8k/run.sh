@@ -11,4 +11,8 @@
 
 set -e
 
-python3 $(dirname $0)/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
+cd $(dirname $0)
+
+python3 bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319 $*
+
+cd -

@@ -1,0 +1,1 @@
+{"task": "mmlu", "num_gpus": 1, "latency": 15.376, "accuracy": 0.0, "num_requests": 14042, "other": {"nsub": 100}}

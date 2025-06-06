@@ -529,12 +529,12 @@ class DeepseekV2AttentionMLA(nn.Module):
     def register_mf_tool(self, layer: RadixAttention):
         bank_size = 64
         modes = [
-            # "prefill_quant",    # whether to quantize key/value/query/score when prefill
-            # "cache_quant",      # whether to quantize cached key & value
+            "prefill_quant",    # whether to quantize key/value/query/score when prefill
+            "cache_quant",      # whether to quantize cached key & value
             
-            "prefill_x_attn",   # whether to mask partial score when prefill
+            # "prefill_x_attn",   # whether to mask partial score when prefill
             
-            # "retrieve",         # whether to quantize cached key and retrieve tokens when decode
+            "retrieve",         # whether to quantize cached key and retrieve tokens when decode
         ]
         
         from sparseopt.attns.retriever import MFSparseNbits, TokenSparseRetriever
@@ -568,7 +568,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_cache_tool = v_tool
         retriever = TokenSparseRetriever(
             active=True,
-            retain_size=2048,
+            # retain_size=2048,
+            retain_size=4096,
             # retain_size=128,
             # retain_size=256,
             # retain_size=5,
@@ -595,12 +596,22 @@ class DeepseekV2AttentionMLA(nn.Module):
             prefill_chunk=True,
             qk_scaling=layer.scaling, # TODO: unmark code for scaling
         )
+        # retrieve_q_tool = MFSparseNbits(
+        #     bank_size=bank_size,
+        #     sparsity=0.,
+        #     quant_mode="per_bank",
+        #     num_bits={"high": 8, "low": 0},
+        #     quant_symmetric=True,
+        #     quant_masked=True,
+        # )
+        retrieve_q_tool = lambda x: x
         setattr(layer, "q_tool", q_tool)
         setattr(layer, "k_tool", k_tool)
         setattr(layer, "v_tool", v_tool)
         setattr(layer, "k_cache_tool", k_cache_tool)
         setattr(layer, "v_cache_tool", v_cache_tool)
         setattr(layer, "retriever", retriever)
+        setattr(layer, "retrieve_q_tool", retrieve_q_tool)
         setattr(layer, "modes", modes)
 
     def forward(

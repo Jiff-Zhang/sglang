@@ -89,8 +89,8 @@ class ModelRunner:
         is_draft_worker: bool = False,
     ):
         # TODO: Whether to use Moffett tool
-        self.is_moffett = False
-        # self.is_moffett = True
+        # self.is_moffett = False
+        self.is_moffett = True
         
         # Parse args
         self.model_config = model_config

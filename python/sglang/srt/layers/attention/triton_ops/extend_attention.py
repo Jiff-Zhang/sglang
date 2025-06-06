@@ -79,7 +79,9 @@ def quantize_2d(
     
     # quant
     x = tl.clamp(
-        tl.div_rn(x, scales),
+        # TODO: check if tl.div_rn works noramlly
+        tl.floor(x / scales + 0.5),
+        # tl.div_rn(x, scales),
         -max_int if num_bits > 1 else -1,
         max_int
     )
@@ -597,15 +599,18 @@ def extend_attention_fwd(
                 # import time; time.sleep(1)
             stride, block = 1, 1
             stride, block = 4, 4
-            stride, block = 8, 8
-            stride, block = 8, 64
+            stride, block = 4, 64
+            # stride, block = 8, 8
+            # stride, block = 8, 64
+            # stride, block = 16, 64
             threshold = 0.9
             threshold = 0.95
             threshold = 0.98
             threshold = None
             len_ratio = 0.2
             len_ratio = 0.25
-            len_ratio = 0.5
+            len_ratio = 0.4
+            # len_ratio = 0.5
             # len_ratio = None
             try:
                 qk_extend = adjust_x_attn_qk(
@@ -727,7 +732,7 @@ def adjust_x_attn_qk(
         num_blocks = (blocks_num_nonzero > 0).int().sum(dim=-1)
         retain_len = (num_blocks.float() * len_ratio).ceil().int()
         if verbose:
-            debug(num_blocks.size(), num_blocks, retain_len)
+            debug(num_blocks.size(), num_blocks[:, -1], retain_len[:, -1])
             # if retain_len[:, -1].sum() == 0:
             #     import torch.distributed as dist
             #     if dist.get_rank() == 0:

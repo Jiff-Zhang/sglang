@@ -124,6 +124,58 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
+        # TODO: for llama linear input quantization
+        quant = False
+        quant = True
+        if quant:
+            from sparseopt.attns.act_sparse_nbits import MFSparseNbits, ModelDecorator
+            from torch import nn
+            in_tool = MFSparseNbits(
+                sparsity=0.,
+                # sparsity=0.75,
+                # sparsity=0.875,
+                bank_size=64,
+                # dtypes={"high": "int8", "low": "int4"},
+                # dtypes={"high": "int8", "low": "zero"},
+                dtypes={"high": "fp8_e4m3", "low": "zero"},
+                quant_mode="per_bank",
+                quant_symmetric=True,
+                quant_masked=True,
+            )
+            w_tool = MFSparseNbits(
+                sparsity=0.,
+                # sparsity=0.75,
+                # sparsity=0.875,
+                bank_size=64,
+                # dtypes={"high": "int8", "low": "int4"},
+                # dtypes={"high": "int8", "low": "zero"},
+                dtypes={"high": "fp8_e4m3", "low": "zero"},
+                quant_mode="per_bank",
+                quant_symmetric=True,
+                quant_masked=True,
+            )
+            def hook_func(module: nn.Module, inputs):
+                inputs = (in_tool(inputs[0]), *inputs[1:])
+                return inputs
+            
+            md = ModelDecorator()
+            from sglang.srt.layers.linear import LinearBase
+            from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+            md.input_hook(
+                self.model_runner.model,
+                hook_func,
+                model_classes=[LinearBase]
+            )
+            md.weight_adjust(
+                self.model_runner.model,
+                lambda x: w_tool(x),
+                model_classes=[LinearBase]
+            )
+            print('##### input tool #####')
+            in_tool.print_stats()
+            print('##### weight tool #####')
+            w_tool.print_stats()
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
