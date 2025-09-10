@@ -25,6 +25,7 @@ KVCache actually holds the physical kv cache.
 """
 
 import abc
+import time
 import logging
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Union
@@ -37,6 +38,9 @@ import triton.language as tl
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+
+from sglang.srt.mf_tool import MFSparseNbits, quantize
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 
 logger = logging.getLogger(__name__)
 
@@ -879,6 +883,161 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+class MFMLATokenToKVPool(MLATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.label_buffer = [
+                    torch.zeros(
+                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+                
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        # assert hasattr(self, "label_buffer")
+        # for label in self.label_buffer:
+        #     kv_size_bytes += np.prod(label.shape) * label.dtype.itemsize
+        return kv_size_bytes * 2
+    
+    def get_label_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.label_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.label_buffer[layer_id - self.start_layer]
+    
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor=None, # [B]
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+
+        self.label_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
+        time_stamp = time.time()
+        if "retrieve" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.label_buffer[layer_id - self.start_layer],
+                layer.retriever.tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+            )
+        
+        # if "cache_quant" in getattr(layer, 'modes', []):
+        #     self.quantize(
+        #         self.kv_buffer[layer_id],
+        #         layer.k_tool,
+        #         loc=loc,
+        #         kv_indptr=kv_indptr,
+        #         kv_indices=kv_indices,
+        #         qo_indptr=qo_indptr,
+        #     )
+
+        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+            if qo_indptr is None:
+                cur_avg_len = 1
+                avg_len = len(kv_indices) / (len(kv_indptr) - 1)
+            else:
+                cur_avg_len = qo_indptr[-1].item() / (len(qo_indptr) - 1)
+                avg_len = (len(kv_indices) + len(cache_k)) / (len(kv_indptr) - 1)
+            time_used = time.time() - time_stamp
+            total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / len(self.kv_buffer)
+            logger.debug(
+                f"<MFMLATokenToKVPool.set_kv_buffer> "
+                f"#time used: {time_used:.3f}s / {total_time_used:.3f}s, "
+                f"#modes: {getattr(layer, 'modes', [])}, "
+                f"#key_to_cache.shape: {list(cache_k.shape)}, "
+                f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+                f"#kv_indices.shape: {list(kv_indices.shape)}, "
+                f"#key_to_cache_avg_len: {cur_avg_len:.2f}, "
+                f"#key_cache_avg_len: {avg_len:.2f}, "
+            )
+            self.time_stamp = time.time()
+
+    def quantize(
+        self,
+        buffer: torch.Tensor,
+        tool: MFSparseNbits,
+        loc: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor, # [B]
+    ):
+        if not tool.is_seq_rely:
+            buffer[loc] = quantize(buffer[loc], tool)
+            return
+            
+        is_decode = qo_indptr is None
+        for i in range(len(kv_indptr) - 1):
+            cur_len = kv_indptr[i + 1] - kv_indptr[i]
+            if is_decode:
+                ori_len = cur_len - 1
+                idx = kv_indices[kv_indptr[i]: kv_indptr[i + 1]]
+            else:
+                ori_len = cur_len
+                cur_len = cur_len + qo_indptr[i + 1] - qo_indptr[i]
+                idx = torch.cat(
+                    [
+                        kv_indices[kv_indptr[i]: kv_indptr[i + 1]],
+                        loc[qo_indptr[i]: qo_indptr[i + 1]]
+                    ],
+                    dim=0
+                )
+        ori_len = ori_len // tool.bank_size * tool.bank_size
+        cur_len = cur_len // tool.bank_size * tool.bank_size
+        if cur_len > ori_len:
+            buffer[idx[ori_len: cur_len]] = quantize(
+                buffer[idx[ori_len: cur_len]], tool
+            )
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):

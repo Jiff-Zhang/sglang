@@ -85,6 +85,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    MFMLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -177,6 +178,10 @@ class ModelRunner:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
+        # TODO: Whether to use Moffett tool, temporarily active when using MLATokenToKVPool
+        # self.is_moffett = False
+        self.is_moffett = True
+        
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -1065,6 +1070,8 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if self.is_moffett:
+                cell_size *= 2
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -1308,7 +1315,11 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         elif self.use_mla_backend:
-            self.token_to_kv_pool = MLATokenToKVPool(
+            if self.is_moffett:
+                MLATokenToKVPoolClass = MFMLATokenToKVPool
+            else:
+                MLATokenToKVPoolClass = MLATokenToKVPool
+            self.token_to_kv_pool = MLATokenToKVPoolClass(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,

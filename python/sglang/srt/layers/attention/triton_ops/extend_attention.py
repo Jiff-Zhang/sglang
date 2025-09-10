@@ -195,6 +195,7 @@ def _fwd_kernel(
                 other=0.0,
             )
 
+            # tl.static_print(q.shape, k.shape)
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (

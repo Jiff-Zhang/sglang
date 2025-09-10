@@ -32,6 +32,8 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -120,6 +122,8 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+
+from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -969,9 +973,113 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
 
+        # TODO: register moffett tool
+        self.register_mf_tool(self.attn_mha)
+        self.register_mf_tool(self.attn_mqa)
+        
+    def register_mf_tool(self, layer: RadixAttention):
+        # return
+        bank_size = 64
+        modes = [
+            "retrieve",         # whether to quantize cached key and retrieve tokens when decode
+        ]
+        
+        # q_tool = MFSparseNbits(
+        #     bank_size=bank_size,
+        #     sparsity=0.,
+        #     quant_mode="per_bank",
+        #     dtypes={"high": "int8", "low": "zero"},
+        #     quant_symmetric=True,
+        #     quant_masked=True,
+        # )
+        # k_tool = MFSparseNbits(
+        #     bank_size=bank_size,
+        #     sparsity=0.,
+        #     # quant_mode="per_bank",
+        #     quant_mode="per_block",
+        #     dtypes={"high": "int8", "low": "zero"},
+        #     quant_symmetric=True,
+        #     quant_masked=True,
+        # )
+        # k_cache_tool = k_tool
+        # v_tool = MFSparseNbits(
+        #     bank_size=bank_size,
+        #     sparsity=0.,
+        #     # quant_mode="per_group",
+        #     quant_mode="per_block",
+        #     dtypes={"high": "int8", "low": "zero"},
+        #     quant_symmetric=True,
+        #     quant_masked=True,
+        # )
+        # v_cache_tool = v_tool
+        retriever = TokenSparseRetriever(
+            active=True,
+            # retain_size=2048,
+            # retain_size=4096,
+            retain_size=8192,
+            chunk_size=1,
+            recent_size=64,
+            bank_size=bank_size,
+            sparsity=0.875,
+            dtypes={"high": "int4", "low": "zero"},
+            sparse_mode="per_bank",
+            quant_mode="per_bank",
+            q_dtypes={"high": "int8", "low": "zero"},
+            q_sparse_mode="per_bank",
+            q_quant_mode="per_bank",
+            # share=False,
+            share=True,
+            share_mode="mean",
+            # share_mode="max",
+            mean_trick=False,
+            # mean_trick=True,
+            # softmax_scale=False,
+            softmax_scale=True,
+            softmax_version="v0",
+            # topk_version='v0',
+            # topk_version='v2',
+            # topk_version='v2.1',
+            topk_version='v2.2',
+            topk_chunk_size=64,
+            # # topk_version='v3',
+            # # topk_version='v3.1',
+            # topk_version='v3.2',
+            # # topk_mini_k=256,
+            # topk_mini_k=-1,
+            # topk_chunk_size=4096,
+            all_reduce=True,
+            auto_reset=False,
+            qk_scaling=layer.scaling, # TODO: unmark code for scaling
+        )
+        # setattr(layer, "q_tool", q_tool)
+        # setattr(layer, "k_tool", k_tool)
+        # setattr(layer, "v_tool", v_tool)
+        # setattr(layer, "k_cache_tool", k_cache_tool)
+        # setattr(layer, "v_cache_tool", v_cache_tool)
+        setattr(layer, "retriever", retriever)
+        setattr(layer, "modes", modes)
+        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+            print(f"### modes ###")
+            print(modes)
+            print(f"### retriever ###")
+            retriever.print_stats()
+            # print(f"### q_tool ###")
+            # q_tool.print_stats()
+            # print(f"### k_tool ###")
+            # k_tool.print_stats()
+            # print(f"### v_tool ###")
+            # v_tool.print_stats()
+            # print(f"### k_cache_tool ###")
+            # k_cache_tool.print_stats()
+            # print(f"### v_cache_tool ###")
+            # v_cache_tool.print_stats()
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
+        # Only return MLA for now ---- absorb mode
+        return AttnForwardMethod.MLA
+    
         def _dispatch_mla_subtype():
             if _is_hip:
                 if (
@@ -1104,6 +1212,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        
+        # if get_attention_tp_rank() == 0 and self.layer_id == 0:
+        #     logger.debug(
+        #         f"<DeepseekV2AttentionMLA.forward_prepare> "
+        #         f"#attn_forward_method: {attn_forward_method}, "
+        #         f"#forward_mode: {forward_batch.forward_mode}, "
+        #         f"#hidden_states.shape: {list(hidden_states.shape)}, "
+        #     )
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(

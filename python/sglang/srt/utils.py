@@ -89,6 +89,7 @@ from triton.runtime.cache import FileCacheManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.logger import ColoredFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -972,11 +973,16 @@ def configure_logger(server_args, prefix: str = ""):
             custom_config = json.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
+    # format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    format = f"[%(asctime)s{prefix}] %(levelname)8s - %(message)s"
+    formatter = ColoredFormatter(format)
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
-        format=format,
+        # format=format,
+        handlers=[handler],
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
