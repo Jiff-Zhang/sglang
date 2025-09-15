@@ -37,6 +37,63 @@ def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
+@triton.jit
+def quantize_2d(
+    x,
+    num_bits: tl.constexpr,
+    bank_size: tl.constexpr,
+    dim: tl.constexpr,
+    magic_num: tl.constexpr=1.0,
+    active: tl.constexpr=False,
+):
+    if not active:
+        return x
+    
+    # TODO: quant attention weights
+    # tl.static_print(active, num_bits, bank_size, dim, x.shape)
+    # tl.device_print('max', tl.max(x))
+    # x_p = tl.zeros_like(x)
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+
+    # reshape to bank_size
+    x = tl.reshape(
+        x, 
+        (x.shape[0], x.shape[1] // bank_size, bank_size)
+    )
+    
+    # symmetric quantization
+    max_ranges = tl.max(tl.abs(x), axis=2, keep_dims=True) * magic_num
+    max_int = 2 ** (num_bits - 1) - 1
+    scales = max_ranges / max_int if num_bits > 1 else max_ranges
+    # scales = max_ranges / (max_int + 1) if self.num_bits > 1 else max_ranges
+
+    # set num less than smallest number to smallest number to avoid overflow
+    # smallest_normal = torch.finfo(x.dtype).smallest_normal * max_ranges.clamp(1) 
+    # scales = torch.maximum(scales, smallest_normal)
+    # scales[scales < smallest_normal] = smallest_normal
+    # scales[scales == 0] = 1
+    scales = tl.where(scales == 0, 1, scales)
+    
+    # quant
+    x = tl.clamp(
+        # TODO: check if tl.div_rn works noramlly
+        tl.floor(x / scales + 0.5),
+        # tl.div_rn(x, scales),
+        -max_int if num_bits > 1 else -1,
+        max_int
+    )
+    x = x * scales
+
+    # revert shape
+    x = tl.reshape(x, (x.shape[0], x.shape[1] * x.shape[2]))
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+    # return tl.reshape(x, x_p.shape)
+    return x
+
 
 @triton.jit
 def _fwd_kernel(
@@ -82,6 +139,7 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    ACT_QUANT: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -237,6 +295,9 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            p = quantize_2d(
+                p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT
+            )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -341,6 +402,9 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
+            p = quantize_2d(
+                p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT
+            )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -391,6 +455,7 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    act_quant=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -510,6 +575,7 @@ def extend_attention_fwd(
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
+        ACT_QUANT=act_quant,
         **extra_kargs,
     )
 

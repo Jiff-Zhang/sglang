@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
 
 from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
 from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
+from sglang.srt.mf_tool import quantize
 
 import logging
 logger = logging.getLogger(__name__)
@@ -717,6 +718,152 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def get_extend_metadata(self, layer):
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            sliding_window_size = (
+                layer.sliding_window_size
+            )  # Needed for sliding window mask
+            kv_indptr = self.forward_metadata.window_kv_indptr
+            kv_indices = self.forward_metadata.window_kv_indices
+            window_kv_offsets = self.forward_metadata.window_kv_offsets
+        else:
+            sliding_window_size = -1
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            window_kv_offsets = None
+        return sliding_window_size, kv_indptr, kv_indices, window_kv_offsets
+
+    def kv_cache_transfer(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        layer: RadixAttention,
+        cache_func=None,
+    ):
+        if cache_func is None:
+            return k_cache, v_cache, kv_indptr, kv_indices
+
+        time_stamp = time.time()
+        k_cache_list = list()
+        v_cache_list = list()
+        for i in range(len(kv_indptr) - 1):
+            k, v = cache_func(
+                k_cache[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
+                v_cache[kv_indices[kv_indptr[i] : kv_indptr[i + 1]]],
+            )
+            k_cache_list.append(k)
+            v_cache_list.append(v)
+
+        k_cache_n = torch.cat(k_cache_list, dim=0)
+        v_cache_n = torch.cat(v_cache_list, dim=0)
+        kv_indices = torch.arange(
+            k_cache_n.size(0), device=kv_indices.device, dtype=kv_indices.dtype
+        )
+        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+            logger.debug(
+                f"<TritonAttnBackend.kv_cache_transfer> "
+                f"#time used: {time.time() - time_stamp:.3f}s, "
+                f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+                f"#kv_indices.shape: {list(kv_indices.shape)}, "
+                f"#ori k_cache.shape: {list(k_cache.shape)}, "
+                f"#ori v_cache.shape: {list(v_cache.shape)}, "
+                f"#new k_cache.shape: {list(k_cache_n.shape)}, "
+                f"#new v_cache.shape: {list(v_cache_n.shape)}, "
+            )
+        return k_cache_n, v_cache_n, kv_indptr, kv_indices
+
+    def quantize(
+        self,
+        x: torch.Tensor, # [S, H, D]
+        tool: MFSparseNbits,
+        indptr: torch.Tensor=None,
+    ):
+        if not tool.is_seq_rely or indptr is None:
+            return quantize(x, tool)
+        
+        x = x.clone()
+        for i in range(len(indptr) - 1):
+            idx = torch.arange(indptr[i], indptr[i+1])
+            x[idx] = quantize(x[idx], tool)
+        return x
+
+    def prefill_quant(
+        self,
+        q: torch.Tensor, #[S, H_q, D_a]
+        k: torch.Tensor, # [S, H_k, D_a]
+        v: torch.Tensor, # [S, H_k, D_v]
+        qo_indptr: torch.Tensor, # [B]
+        k_cache: torch.Tensor, # [CS, H_k, D_a]
+        v_cache: torch.Tensor, # [CS, H_k, D_v]
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        layer: RadixAttention,
+    ):
+        if "prefill_quant" not in getattr(layer, "modes", []):
+            return q, k, v, qo_indptr, k_cache, v_cache, kv_indptr, kv_indices
+
+        assert hasattr(layer, "q_tool") and \
+            hasattr(layer, "k_tool") and \
+            hasattr(layer, "v_tool"), \
+            f"layer {layer.layer_id} does not have q/k/v tools"
+            
+        time_stamp = time.time()
+        q_tool = layer.q_tool
+        k_tool = layer.k_tool
+        v_tool = layer.v_tool
+        # q = q.clone()
+        # k = k.clone()
+        # v = v.clone()
+        # query/key/value quantization
+        q = self.quantize(q, q_tool, qo_indptr)
+        k = self.quantize(k, k_tool, qo_indptr)
+        v = self.quantize(v, v_tool, qo_indptr)
+
+        # k_cache_list = list()
+        # v_cache_list = list()
+        # for i in range(len(kv_indptr) - 1):
+        #     k_cache_list.append(
+        #         self.quantize(
+        #             k_cache[kv_indices[kv_indptr[i]: kv_indptr[i + 1]]], k_tool
+        #         )
+        #     )
+        #     v_cache_list.append(
+        #         self.quantize(
+        #             v_cache[kv_indices[kv_indptr[i]: kv_indptr[i + 1]]], v_tool
+        #         )
+        #     )
+        # k_cache = torch.cat(k_cache_list, dim=0)
+        # v_cache = torch.cat(v_cache_list, dim=0)
+        
+        k_cache = self.quantize(k_cache[kv_indices], k_tool, kv_indptr)
+        v_cache = self.quantize(v_cache[kv_indices], v_tool, kv_indptr)
+        kv_indices = torch.arange(
+            k_cache.size(0), device=kv_indices.device, dtype=kv_indices.dtype
+        )
+        
+        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+            time_used = time.time() - time_stamp
+            total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / getattr(self, 'layer_num', 1)
+            logger.debug(
+                f"<TritonAttnBackend.prefill_quant> "
+                f"#time used: {time_used:.3f}s / {total_time_used:.3f}s, "
+                f"#q.shape: {list(q.shape)}, "
+                f"#k.shape: {list(k.shape)}, "
+                f"#v.shape: {list(v.shape)}, "
+                f"#qo_indptr: {list(qo_indptr.shape)}, "
+                f"#avg_len: {qo_indptr[-1].item() / (len(qo_indptr) - 1):.2f}, "
+                f"#k_cache.shape: {list(k_cache.shape)}, "
+                f"#v_cache.shape: {list(v_cache.shape)}, "
+                f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+                f"#kv_indices.shape: {list(kv_indices.shape)}, "
+                f"#cache_avg_len: {kv_indptr[-1].item() / (len(kv_indptr) - 1):.2f}, "
+            )
+            self.time_stamp = time.time()
+
+        return q, k, v, qo_indptr, k_cache, v_cache, kv_indptr, kv_indices
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -726,6 +873,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        cache_func=None,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -739,18 +887,21 @@ class TritonAttnBackend(AttentionBackend):
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            sliding_window_size = (
-                layer.sliding_window_size
-            )  # Needed for sliding window mask
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
-            window_kv_offsets = self.forward_metadata.window_kv_offsets
-        else:
-            sliding_window_size = -1
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
-            window_kv_offsets = None
+        # if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        #     sliding_window_size = (
+        #         layer.sliding_window_size
+        #     )  # Needed for sliding window mask
+        #     kv_indptr = self.forward_metadata.window_kv_indptr
+        #     kv_indices = self.forward_metadata.window_kv_indices
+        #     window_kv_offsets = self.forward_metadata.window_kv_offsets
+        # else:
+        #     sliding_window_size = -1
+        #     kv_indptr = self.forward_metadata.kv_indptr
+        #     kv_indices = self.forward_metadata.kv_indices
+        #     window_kv_offsets = None
+        sliding_window_size, kv_indptr, kv_indices, window_kv_offsets = \
+            self.get_extend_metadata(layer)
+        qo_indptr = self.forward_metadata.qo_indptr
 
         if save_kv_cache:
             if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
@@ -758,12 +909,32 @@ class TritonAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, v,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    qo_indptr=self.forward_metadata.qo_indptr,
+                    qo_indptr=qo_indptr,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
+            
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache =forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_cache, v_cache, kv_indptr, kv_indices = self.kv_cache_transfer(
+            k_cache, v_cache, kv_indptr, kv_indices, 
+            layer=layer, cache_func=cache_func
+        )
+
+        q, k, v, qo_indptr, k_cache, v_cache, kv_indptr, kv_indices = \
+            self.prefill_quant(
+                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k=k,
+                v=v,
+                qo_indptr=qo_indptr,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                layer=layer,
+            )
 
         if get_attention_tp_rank() == 0 and layer.layer_id == 0:
             logger.debug(
@@ -772,21 +943,24 @@ class TritonAttnBackend(AttentionBackend):
                 f"#q.shape: {list(q.shape)}, "
                 f"#k.shape: {list(k.shape)}, "
                 f"#v.shape: {list(v.shape)}, "
-                # f"#k_cache.shape: {list(forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape)}, "
-                # f"#v_cache.shape: {list(forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape)}, "
+                f"#k_cache.shape: {list(k_cache.shape)}, "
+                f"#v_cache.shape: {list(v_cache.shape)}, "
                 f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
                 f"#kv_indices.shape: {list(kv_indices.shape)}, "
                 f"#qo_indptr.shape: {list(self.forward_metadata.qo_indptr.shape)}, "
             )
 
         self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            # q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            q.contiguous(),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
+            # forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            k_cache,
+            # forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            v_cache,
+            qo_indptr,
             kv_indptr,
             kv_indices,
             self.forward_metadata.custom_mask,
@@ -799,6 +973,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            act_quant="prefill_quant" in getattr(layer, "modes", []),
         )
         return o
 

@@ -124,6 +124,8 @@ from sglang.srt.utils import (
 )
 
 from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
+from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -179,6 +181,9 @@ class AttnForwardMethod(IntEnum):
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()
+
+    # Use MHA with chunked kv, only for prefill
+    MHA_CHUNKED_KV_PREFILL = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -981,37 +986,42 @@ class DeepseekV2AttentionMLA(nn.Module):
         # return
         bank_size = 64
         modes = [
+            "prefill_quant",    # whether to quantize key/value/query/score when prefill
+            "cache_quant",      # whether to quantize cached key & value
             "retrieve",         # whether to quantize cached key and retrieve tokens when decode
         ]
+
+        per_bank_tool = MFSparseNbits(
+            bank_size=bank_size,
+            sparsity=0.,
+            quant_mode="per_bank",
+            dtypes={"high": "int8", "low": "zero"},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+        per_group_tool = MFSparseNbits(
+            bank_size=bank_size,
+            sparsity=0.,
+            quant_mode="per_group",
+            dtypes={"high": "int8", "low": "zero"},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+        per_block_tool = MFSparseNbits(
+            bank_size=bank_size,
+            sparsity=0.,
+            quant_mode="per_block",
+            dtypes={"high": "int8", "low": "zero"},
+            quant_symmetric=True,
+            quant_masked=True,
+        )
+
+        q_tool = per_bank_tool
+        k_tool = per_bank_tool
+        v_tool = per_group_tool
+        k_cache_tool = per_bank_tool
+        v_cache_tool = per_group_tool
         
-        # q_tool = MFSparseNbits(
-        #     bank_size=bank_size,
-        #     sparsity=0.,
-        #     quant_mode="per_bank",
-        #     dtypes={"high": "int8", "low": "zero"},
-        #     quant_symmetric=True,
-        #     quant_masked=True,
-        # )
-        # k_tool = MFSparseNbits(
-        #     bank_size=bank_size,
-        #     sparsity=0.,
-        #     # quant_mode="per_bank",
-        #     quant_mode="per_block",
-        #     dtypes={"high": "int8", "low": "zero"},
-        #     quant_symmetric=True,
-        #     quant_masked=True,
-        # )
-        # k_cache_tool = k_tool
-        # v_tool = MFSparseNbits(
-        #     bank_size=bank_size,
-        #     sparsity=0.,
-        #     # quant_mode="per_group",
-        #     quant_mode="per_block",
-        #     dtypes={"high": "int8", "low": "zero"},
-        #     quant_symmetric=True,
-        #     quant_masked=True,
-        # )
-        # v_cache_tool = v_tool
         retriever = TokenSparseRetriever(
             active=True,
             # retain_size=2048,
@@ -1051,11 +1061,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             auto_reset=False,
             qk_scaling=layer.scaling, # TODO: unmark code for scaling
         )
-        # setattr(layer, "q_tool", q_tool)
-        # setattr(layer, "k_tool", k_tool)
-        # setattr(layer, "v_tool", v_tool)
-        # setattr(layer, "k_cache_tool", k_cache_tool)
-        # setattr(layer, "v_cache_tool", v_cache_tool)
+        setattr(layer, "q_tool", q_tool)
+        setattr(layer, "k_tool", k_tool)
+        setattr(layer, "v_tool", v_tool)
+        setattr(layer, "k_cache_tool", k_cache_tool)
+        setattr(layer, "v_cache_tool", v_cache_tool)
         setattr(layer, "retriever", retriever)
         setattr(layer, "modes", modes)
         if get_attention_tp_rank() == 0 and layer.layer_id == 0:
@@ -1063,22 +1073,26 @@ class DeepseekV2AttentionMLA(nn.Module):
             print(modes)
             print(f"### retriever ###")
             retriever.print_stats()
-            # print(f"### q_tool ###")
-            # q_tool.print_stats()
-            # print(f"### k_tool ###")
-            # k_tool.print_stats()
-            # print(f"### v_tool ###")
-            # v_tool.print_stats()
-            # print(f"### k_cache_tool ###")
-            # k_cache_tool.print_stats()
-            # print(f"### v_cache_tool ###")
-            # v_cache_tool.print_stats()
+            print(f"### q_tool ###")
+            q_tool.print_stats()
+            print(f"### k_tool ###")
+            k_tool.print_stats()
+            print(f"### v_tool ###")
+            v_tool.print_stats()
+            print(f"### k_cache_tool ###")
+            k_cache_tool.print_stats()
+            print(f"### v_cache_tool ###")
+            v_cache_tool.print_stats()
 
     def dispatch_attn_forward_method(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch,
+        is_decode: bool=False,
     ) -> AttnForwardMethod:
         # Only return MLA for now ---- absorb mode
-        return AttnForwardMethod.MLA
+        if is_decode:
+            return AttnForwardMethod.MLA
+        else:
+            return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
     
         def _dispatch_mla_subtype():
             if _is_hip:
@@ -1180,6 +1194,31 @@ class DeepseekV2AttentionMLA(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def mla2mha_cache(self, latent_cache: torch.Tensor):
+        kv_a_normed, k_pe = latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_a_normed = kv_a_normed.squeeze(1).contiguous()
+        kv = self.kv_b_proj(kv_a_normed)[0]
+        kv = kv.view(
+            -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        v = kv[..., self.qk_nope_head_dim :]
+        k_nope = kv[..., : self.qk_nope_head_dim]
+
+        k = torch.empty(
+            (
+                k_nope.shape[0],
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+            ),
+            dtype=v.dtype,
+            device=v.device,
+        )
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        return k, v
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1211,15 +1250,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch, is_decode=forward_batch.forward_mode.is_decode())
         
-        # if get_attention_tp_rank() == 0 and self.layer_id == 0:
-        #     logger.debug(
-        #         f"<DeepseekV2AttentionMLA.forward_prepare> "
-        #         f"#attn_forward_method: {attn_forward_method}, "
-        #         f"#forward_mode: {forward_batch.forward_mode}, "
-        #         f"#hidden_states.shape: {list(hidden_states.shape)}, "
-        #     )
+        if get_attention_tp_rank() == 0 and self.layer_id == 0:
+            logger.debug(
+                f"<DeepseekV2AttentionMLA.forward_prepare> "
+                f"#attn_forward_method: {attn_forward_method}, "
+                f"#forward_mode: {forward_batch.forward_mode, forward_batch.forward_mode.is_decode()}, "
+                f"#hidden_states.shape: {list(hidden_states.shape)}, "
+            )
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1227,6 +1266,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_PREFILL:
+            inner_state = self.forward_normal_chunked_kv_prefill_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
@@ -1256,6 +1299,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_PREFILL:
+            return self.forward_normal_chunked_kv_prefill_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
@@ -1304,14 +1349,44 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
             # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-            )
+            if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+                assert isinstance(forward_batch.attn_backend, TritonAttnBackend), f"MFMLATokenToKVPool only supports TritonAttnBackend"
+                _, kv_indptr, kv_indices, _ = forward_batch.attn_backend.get_extend_metadata(self.attn_mha)
+                qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.attn_mha,
+                    forward_batch.out_cache_loc,
+                    latent_cache,
+                    None,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    qo_indptr=qo_indptr,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                )
         else:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
+            
+        # k_r, v_r = self.mla2mha_cache(latent_cache)
+        # if get_attention_tp_rank() == 0 and self.layer_id == 0:
+        # # if True:
+        #     logger.debug(
+        #         f"<DeepseekV2AttentionMLA.forward_normal_prepare> "
+        #         f"#layer_id: {self.layer_id}, "
+        #         f"#q.shape: {list(q.shape)}, "
+        #         f"#k_r.shape: {list(k_r.shape)}, "
+        #         f"#v_r.shape: {list(v_r.shape)}, "
+        #         f"#k.shape: {list(k.shape)}, "
+        #         f"#v.shape: {list(v.shape)}, "
+        #         f"#latent_cache.shape: {list(latent_cache.shape)}, "
+        #         f"allclose(k, k_r): {torch.allclose(k, k_r)}, "
+        #         f"allclose(v, v_r): {torch.allclose(v, v_r)}, "
+        #     )
 
         return q, k, v, forward_batch
 
@@ -1877,6 +1952,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def forward_normal_chunked_kv_prefill_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+        
+    def forward_normal_chunked_kv_prefill_core(self, q, k, v, forward_batch):
+        attn_output = self.attn_mha(
+            q, k, v, forward_batch, save_kv_cache=False,
+            # using cache_func to transfer mla cache to mha cache
+            cache_func=lambda k, v: self.mla2mha_cache(k)
+        )
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 class DeepseekV2DecoderLayer(nn.Module):
 

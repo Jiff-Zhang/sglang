@@ -972,15 +972,15 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 qo_indptr=qo_indptr,
             )
         
-        # if "cache_quant" in getattr(layer, 'modes', []):
-        #     self.quantize(
-        #         self.kv_buffer[layer_id],
-        #         layer.k_tool,
-        #         loc=loc,
-        #         kv_indptr=kv_indptr,
-        #         kv_indices=kv_indices,
-        #         qo_indptr=qo_indptr,
-        #     )
+        if "cache_quant" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.kv_buffer[layer_id],
+                layer.k_tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+            )
 
         if get_attention_tp_rank() == 0 and layer.layer_id == 0:
             if qo_indptr is None:
