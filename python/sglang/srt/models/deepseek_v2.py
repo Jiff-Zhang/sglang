@@ -986,8 +986,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         # return
         bank_size = 64
         modes = [
-            "prefill_quant",    # whether to quantize key/value/query/score when prefill
-            "cache_quant",      # whether to quantize cached key & value
+            # "prefill_quant",    # whether to quantize key/value/query/score when prefill
+            # "cache_quant",      # whether to quantize cached key & value
             "retrieve",         # whether to quantize cached key and retrieve tokens when decode
         ]
 
@@ -1047,9 +1047,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             softmax_scale=True,
             softmax_version="v0",
             # topk_version='v0',
-            # topk_version='v2',
+            topk_version='v2',
             # topk_version='v2.1',
-            topk_version='v2.2',
+            # topk_version='v2.2',
+            # topk_version='v2.3',
             topk_chunk_size=64,
             # # topk_version='v3',
             # # topk_version='v3.1',
@@ -1086,10 +1087,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch,
-        is_decode: bool=False,
     ) -> AttnForwardMethod:
         # Only return MLA for now ---- absorb mode
-        if is_decode:
+        if forward_batch.forward_mode.is_decode():
             return AttnForwardMethod.MLA
         else:
             return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
@@ -1250,7 +1250,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch, is_decode=forward_batch.forward_mode.is_decode())
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         
         if get_attention_tp_rank() == 0 and self.layer_id == 0:
             logger.debug(

@@ -821,22 +821,6 @@ class TritonAttnBackend(AttentionBackend):
         k = self.quantize(k, k_tool, qo_indptr)
         v = self.quantize(v, v_tool, qo_indptr)
 
-        # k_cache_list = list()
-        # v_cache_list = list()
-        # for i in range(len(kv_indptr) - 1):
-        #     k_cache_list.append(
-        #         self.quantize(
-        #             k_cache[kv_indices[kv_indptr[i]: kv_indptr[i + 1]]], k_tool
-        #         )
-        #     )
-        #     v_cache_list.append(
-        #         self.quantize(
-        #             v_cache[kv_indices[kv_indptr[i]: kv_indptr[i + 1]]], v_tool
-        #         )
-        #     )
-        # k_cache = torch.cat(k_cache_list, dim=0)
-        # v_cache = torch.cat(v_cache_list, dim=0)
-        
         k_cache = self.quantize(k_cache[kv_indices], k_tool, kv_indptr)
         v_cache = self.quantize(v_cache[kv_indices], v_tool, kv_indptr)
         kv_indices = torch.arange(
