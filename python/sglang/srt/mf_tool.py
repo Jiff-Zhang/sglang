@@ -1,7 +1,12 @@
+import os
 import math
 import torch
 from sparseopt.attns.act_sparse_nbits import MFSparseNbits
 from sparseopt.attns.retriever import TokenSparseRetriever
+import logging
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+logger = logging.getLogger(__name__)
 
 def quantize(
     x: torch.Tensor, # [S, H, D]
@@ -22,3 +27,17 @@ def quantize(
         ],
         dim=0
     )
+
+def save(
+    x: torch.Tensor, # [S, ..., D]
+    name: str,
+):
+    if get_attention_tp_rank() != 0:
+        return
+
+    out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-R1"
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = "prefill" if x.size(0) > 1 else "decode"
+    out_file = os.path.join(out_dir, f"{prefix}-{name}.pt")
+    logging.debug(f"Saving tensor with shape {x.shape} to {out_file}...")
+    torch.save(x, out_file)

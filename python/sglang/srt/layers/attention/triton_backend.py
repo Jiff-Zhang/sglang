@@ -21,7 +21,7 @@ from sglang.srt.layers.dp_attention import (
 )
 
 from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
-from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
+from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, save as mf_save
 from sglang.srt.mf_tool import quantize
 
 import logging

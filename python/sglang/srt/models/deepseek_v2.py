@@ -123,7 +123,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
-from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
+from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, save as mf_save
 from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
@@ -979,8 +979,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
         # TODO: register moffett tool
-        self.register_mf_tool(self.attn_mha)
-        self.register_mf_tool(self.attn_mqa)
+        # self.register_mf_tool(self.attn_mha)
+        # self.register_mf_tool(self.attn_mqa)
         
     def register_mf_tool(self, layer: RadixAttention):
         # return
@@ -1321,7 +1321,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
+            if self.layer_id == 0:
+                mf_save(q, f"layer{self.layer_id}-q_c")
+                mf_save(latent_cache[..., :self.kv_lora_rank], f"layer{self.layer_id}-kv_c")
+                mf_save(latent_cache[..., self.kv_lora_rank:], f"layer{self.layer_id}-kv_pe")
             q = self.q_a_layernorm(q)
+            if self.layer_id == 0:
+                mf_save(self.q_b_proj(q)[0], f"layer{self.layer_id}-q_b_proj")
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -1343,6 +1349,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
+
+        if self.layer_id == 0:
+            mf_save(kv_a, f"layer{self.layer_id}-norm_kv_c")
+            mf_save(q_pe, f"layer{self.layer_id}-rope_q_pe")
+            mf_save(k_pe, f"layer{self.layer_id}-rope_k_pe")
 
         if not _is_npu:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -1394,6 +1405,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+        if self.layer_id == 0:
+            mf_save(attn_output, f"layer{self.layer_id}-attn")
+            mf_save(output, f"layer{self.layer_id}-o_proj")
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1426,6 +1440,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
+            if self.layer_id == 0:
+                mf_save(q, f"layer{self.layer_id}-q_c")
+                mf_save(latent_cache[..., :self.kv_lora_rank], f"layer{self.layer_id}-kv_c")
+                mf_save(latent_cache[..., self.kv_lora_rank:], f"layer{self.layer_id}-kv_pe")
 
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
@@ -1438,6 +1456,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 q = self.q_a_layernorm(q)
                 k_nope = self.kv_a_layernorm(k_nope)
+            if self.layer_id == 0:
+                mf_save(k_nope, f"layer{self.layer_id}-norm_kv_c")
+                mf_save(self.q_b_proj(q)[0], f"layer{self.layer_id}-q_b_proj")
 
             k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -1488,6 +1509,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if not self._fuse_rope_for_trtllm_mla(forward_batch):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if self.layer_id == 0:
+            mf_save(q_pe, f"layer{self.layer_id}-rope_q_pe")
+            mf_save(k_pe, f"layer{self.layer_id}-rope_k_pe")
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
@@ -1575,6 +1600,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 ).transpose(0, 1),
             )
         output, _ = self.o_proj(attn_bmm_output)
+        if self.layer_id == 0:
+            mf_save(attn_bmm_output, f"layer{self.layer_id}-attn")
+            mf_save(output, f"layer{self.layer_id}-o_proj")
 
         return output
 
@@ -1972,6 +2000,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+        if self.layer_id == 0:
+            mf_save(attn_output, f"layer{self.layer_id}-attn")
+            mf_save(output, f"layer{self.layer_id}-o_proj")
         return output
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -2083,6 +2114,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+        if self.layer_id == 0:
+            mf_save(hidden_states, f"layer{self.layer_id}-add_norm")
+            # mf_save(residual, "add_norm_residual")
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2094,6 +2128,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if self.layer_id == 0:
+            mf_save(hidden_states, f"layer{self.layer_id}-post_add_norm")
+            # mf_save(residual, "post_add_norm_residual")
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2108,6 +2145,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+        if self.layer_id == 0:
+            mf_save(hidden_states, f"layer{self.layer_id}-mlp")
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2116,6 +2155,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        if self.layer_id == 0:
+            mf_save(hidden_states, f"layer{self.layer_id}")
 
         return hidden_states, residual
 
@@ -2279,6 +2321,8 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        mf_save(hidden_states, 'embedding')
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
