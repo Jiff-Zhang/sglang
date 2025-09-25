@@ -194,12 +194,14 @@ class DeepseekV2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        layer_id: Optional[int] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
+        self.layer_id = layer_id
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -238,10 +240,16 @@ class DeepseekV2MLP(nn.Module):
             return x
 
         gate_up, _ = self.gate_up_proj(x)
+        if self.layer_id == 0:
+            mf_save(gate_up, f"layer{self.layer_id}-mlp-gate_up")
         x = self.act_fn(gate_up)
+        if self.layer_id == 0:
+            mf_save(x, f"layer{self.layer_id}-mlp-act_fn")
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
+        if self.layer_id == 0:
+            mf_save(x, f"layer{self.layer_id}-mlp-down_proj")
         return x
 
 
@@ -2075,6 +2083,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                layer_id=self.layer_id,
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
