@@ -974,7 +974,7 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
         
         if "cache_quant" in getattr(layer, 'modes', []):
             self.quantize(
-                self.kv_buffer[layer_id],
+                self.kv_buffer[layer_id - self.start_layer],
                 layer.k_tool,
                 loc=loc,
                 kv_indptr=kv_indptr,
@@ -982,7 +982,8 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 qo_indptr=qo_indptr,
             )
 
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if get_attention_tp_rank() == 0 \
+                and layer.layer_id - layer.start_layer == 0:
             if qo_indptr is None:
                 cur_avg_len = 1
                 avg_len = len(kv_indices) / (len(kv_indptr) - 1)
@@ -995,11 +996,11 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 f"<MFMLATokenToKVPool.set_kv_buffer> "
                 f"#time used: {time_used:.3f}s / {total_time_used:.3f}s, "
                 f"#modes: {getattr(layer, 'modes', [])}, "
-                f"#key_to_cache.shape: {list(cache_k.shape)}, "
+                f"#kv_to_cache.shape: {list(cache_k.shape)}, "
                 f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
                 f"#kv_indices.shape: {list(kv_indices.shape)}, "
-                f"#key_to_cache_avg_len: {cur_avg_len:.2f}, "
-                f"#key_cache_avg_len: {avg_len:.2f}, "
+                f"#kv_to_cache_avg_len: {cur_avg_len:.2f}, "
+                f"#kv_cache_avg_len: {avg_len:.2f}, "
             )
             self.time_stamp = time.time()
 
