@@ -59,6 +59,8 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty
 
+from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, register_mf_tool
+
 Qwen3MoeConfig = None
 
 logger = logging.getLogger(__name__)
@@ -347,6 +349,9 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        
+        # TODO: register moffett tool
+        register_mf_tool(self.attn, num_kv_heads=self.num_kv_heads)
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor

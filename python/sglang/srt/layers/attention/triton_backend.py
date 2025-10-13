@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 
-from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MFTokenToKVPool
 from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
 from sglang.srt.mf_tool import quantize
 
@@ -888,7 +888,7 @@ class TritonAttnBackend(AttentionBackend):
         qo_indptr = self.forward_metadata.qo_indptr
 
         if save_kv_cache:
-            if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+            if isinstance(forward_batch.token_to_kv_pool, MFTokenToKVPool):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v,
                     kv_indptr=kv_indptr,
@@ -966,23 +966,28 @@ class TritonAttnBackend(AttentionBackend):
         q: torch.Tensor, # [B, H_q*D_a]
         kv_indptr: torch.Tensor, # [B+1]
         kv_indices: torch.Tensor, # [S]
-        token_to_kv_pool: MFMLATokenToKVPool,
+        token_to_kv_pool: MFTokenToKVPool,
         layer: RadixAttention,
     ):
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id)
         if "retrieve" not in getattr(layer, "modes", []):
-            return kv_indptr, kv_indices
+            return kv_indptr, kv_indices, k_cache, v_cache
         
         assert isinstance(
-            token_to_kv_pool, MFMLATokenToKVPool
-        ), f"token_to_kv_pool must be MFMLATokenToKVPool"
+            token_to_kv_pool, MFTokenToKVPool
+        ), f"token_to_kv_pool must be MFTokenToKVPool"
         assert hasattr(layer, "retriever"), \
             f"layer {layer.layer_id} does not have retriever"
+        assert hasattr(layer, "num_kv_heads"), \
+            f"layer {layer.layer_id} does not have num_kv_heads"
+        num_kv_heads = layer.num_kv_heads
 
         time_stamp = time.time()
         retriever: TokenSparseRetriever = layer.retriever
-        k_cache = token_to_kv_pool.get_label_buffer(layer.layer_id)
+        label_cache = token_to_kv_pool.get_label_buffer(layer.layer_id)
         if not retriever.active:
-            return kv_indptr, kv_indices
+            return kv_indptr, kv_indices, k_cache, v_cache
         
         # [B, H_q, 1, D]
         q_reverted = q.view(q.size(0), -1, 1, layer.qk_head_dim)
@@ -994,71 +999,98 @@ class TritonAttnBackend(AttentionBackend):
         seq_idx = torch.where(seq_len > retriever.retain_size)[0]
         if seq_idx.numel() == 0:
             kv_indptr_n, kv_indices_n = kv_indptr, kv_indices
+            k_cache_n, v_cache_n = k_cache, v_cache
         else:
             # if retriever.topk_version in ['v2', 'v2.1', 'v3', 'v3.1']:
             if True:
                 kv_indices_n = list()
+                # for num_kv_heads > 1
+                k_cache_n = list()
+                v_cache_n = list()
+                cum_len = 0
                 for i in range(q_reverted.size(0)):
-                    if i not in seq_idx:
-                        kv_indices_n.append(
-                            kv_indices[kv_indptr[i]: kv_indptr[i+1]]
-                        )
-                    else:
-                        retriever._reset()
+                    retriever._reset()
+                    if num_kv_heads == 1:
                         # [L_k, H_k, D] -> [1, L_k, H_k, D] -> [1, H_k, L_k, D]
                         retriever.update(
-                            k_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
+                            label_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
                         )
-                        # [1, H_q, 1, N] -> [1, H_q, N] -> [1, N]
-                        idx = retriever._fetch_idx(q_reverted[i: i+1]).squeeze(2)[0, 0]
+                        # [1, H_q, 1, N] -> [1, H_q, N]
+                        idx = retriever._fetch_idx(q_reverted[i: i+1]).squeeze(2)
+                        # TODO: only for DeepSeek MLA, [1, H_q, N] -> [1, N]
+                        idx = idx[0, 0]
                         assert idx.min() >= 0, "idx should be non-negative"
-                        kv_indices_n.append(
-                            kv_indices[idx + kv_indptr[i]]
+                        kv_indice = kv_indices[idx + kv_indptr[i]]
+                    else:
+                        assert get_attention_tp_size() == 1, f"Only support one gpu mode, but get {get_attention_tp_size()}"
+                        # TODO: fix for MHA, only support one gpu mode
+                        # [L_k, H_k, D] -> [1, L_k, H_k, D] -> [1, H_k, L_k, D]
+                        k_cache_cur = k_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
+                        v_cache_cur = v_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
+                        label_cache_cur = label_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
+                        retriever.update(label_cache_cur)
+                        k_cache_cur, v_cache_cur, _ = retriever.fetch_kv(
+                            q_reverted[i: i+1],
+                            k_cache_cur,
+                            v_cache_cur
                         )
-                        retriever._reset()
-            else:
-                # [MB, H_q, 1, D]
-                select_q_reverted = q_reverted[seq_idx]
-                # [MB, L_k, H_k, D]
-                select_k_cache = [
-                    k_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]]
-                    for i in seq_idx
-                ]
-                maxlen = max(len(k) for k in select_k_cache)
-                # [MB]
-                pad_info = maxlen - seq_len[seq_idx]
-                # [MB, H_k, maxlen, D], left paddding
-                select_k_cache = torch.stack(
-                    [
-                        F.pad(
-                            k, (0, 0, 0, 0, maxlen - len(k), 0),
-                            mode="constant", value=0
-                        )
-                        for k, pad_len in zip(select_k_cache, pad_info)
-                    ],
-                    dim=0
-                ).transpose(1, 2)
-                # [maxlen], which contains torch.tensor([maxlen, maxlen-1, ..., 2, 1, 0])
-                range_seq = torch.arange(maxlen, device=select_k_cache.device).flip(dims=[0])
-                # [MB, 1, 1, maxlen]
-                mask = (range_seq[None, :] < seq_len[seq_idx][:, None])[:, None, None, :]
-
-                # reset retriever
+                        # [1, H_k, L_k, D] -> [1, L_k, H_k, D] -> [L_k, H_k, D]
+                        k_cache_n.append(k_cache_cur.transpose(1, 2)[0])
+                        v_cache_n.append(v_cache_cur.transpose(1, 2)[0])
+                        kv_indice = torch.arange(
+                            k_cache_cur.size(1),
+                            device=kv_indices.device,
+                            dtype=kv_indices.dtype
+                        ) + cum_len
+                    cum_len += kv_indice.size(0)
+                    kv_indices_n.append(kv_indice)
                 retriever._reset()
-                # retriever.key_buffer = select_k_cache
-                # retriever.seq_len = maxlen
-                retriever.update(select_k_cache)
-                # [MB, H_k, 1, N] -> [MB, HK, N] -> [MB, N]
-                idx = retriever._fetch_idx(select_q_reverted, mask).squeeze(2)[:, 0]
-                # remove offset introduced by padding
-                idx = idx - pad_info[:, None]
-                assert idx.min() >= 0, "idx should be non-negative"
                 
-                kv_indices_n = [
-                    kv_indices[kv_indptr[i]: kv_indptr[i+1]] if i not in seq_idx \
-                        else kv_indices[idx[seq_idx == i][0] + kv_indptr[i]]
-                    for i in range(q_reverted.size(0))
-                ]
+            # TODO: Deprecated
+            # else:
+            #     # [MB, H_q, 1, D]
+            #     select_q_reverted = q_reverted[seq_idx]
+            #     # [MB, L_k, H_k, D]
+            #     select_k_cache = [
+            #         label_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]]
+            #         for i in seq_idx
+            #     ]
+            #     maxlen = max(len(k) for k in select_k_cache)
+            #     # [MB]
+            #     pad_info = maxlen - seq_len[seq_idx]
+            #     # [MB, H_k, maxlen, D], left paddding
+            #     select_k_cache = torch.stack(
+            #         [
+            #             F.pad(
+            #                 k, (0, 0, 0, 0, maxlen - len(k), 0),
+            #                 mode="constant", value=0
+            #             )
+            #             for k, pad_len in zip(select_k_cache, pad_info)
+            #         ],
+            #         dim=0
+            #     ).transpose(1, 2)
+            #     # [maxlen], which contains torch.tensor([maxlen, maxlen-1, ..., 2, 1, 0])
+            #     range_seq = torch.arange(maxlen, device=select_k_cache.device).flip(dims=[0])
+            #     # [MB, 1, 1, maxlen]
+            #     mask = (range_seq[None, :] < seq_len[seq_idx][:, None])[:, None, None, :]
+
+            #     # reset retriever
+            #     retriever._reset()
+            #     # retriever.key_buffer = select_k_cache
+            #     # retriever.seq_len = maxlen
+            #     retriever.update(select_k_cache)
+            #     # [MB, H_k, 1, N] -> [MB, HK, N] -> [MB, N]
+            #     idx = retriever._fetch_idx(select_q_reverted, mask).squeeze(2)[:, 0]
+            #     # remove offset introduced by padding
+            #     idx = idx - pad_info[:, None]
+            #     assert idx.min() >= 0, "idx should be non-negative"
+                
+            #     kv_indices_n = [
+            #         kv_indices[kv_indptr[i]: kv_indptr[i+1]] if i not in seq_idx \
+            #             else kv_indices[idx[seq_idx == i][0] + kv_indptr[i]]
+            #         for i in range(q_reverted.size(0))
+            #     ]
+            
             # set indptr
             kv_indptr_n = kv_indptr.clone()
             kv_indptr_n[0] = 0
@@ -1069,12 +1101,19 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr_n = kv_indptr_n.cumsum(dim=0)
             # merge kv_indices
             kv_indices_n = torch.cat(kv_indices_n, dim=-1)
+
+            if num_kv_heads == 1:
+                k_cache_n = k_cache
+                v_cache_n = v_cache
+            else:
+                k_cache_n = torch.cat(k_cache_n, dim=0)
+                v_cache_n = torch.cat(v_cache_n, dim=0)
             
             # reset retriever
             retriever._reset()
         
         if get_attention_tp_rank() == 0 and layer.layer_id == 0:
-            self.layer_num = len(token_to_kv_pool.kv_buffer)
+            self.layer_num = len(token_to_kv_pool.get_label_buffer(0))
             time_used = time.time() - time_stamp
             total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / getattr(self, 'layer_num', 1)
             ori_info = {
@@ -1097,7 +1136,7 @@ class TritonAttnBackend(AttentionBackend):
                 # f"scaling: {layer.scaling}, "
             )
             self.time_stamp = time.time()
-        return kv_indptr_n, kv_indices_n
+        return kv_indptr_n, kv_indices_n, k_cache_n, v_cache_n
     
     def forward_decode(
         self,
@@ -1129,7 +1168,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
 
         if save_kv_cache:
-            if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+            if isinstance(forward_batch.token_to_kv_pool, MFTokenToKVPool):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v,
                     kv_indptr=kv_indptr,
@@ -1142,7 +1181,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
         
         # TODO: fetch highest-score idx and ptr from kv_indices, kv_indptr
-        kv_indptr, kv_indices = self.fetch_idx(
+        kv_indptr, kv_indices, k_cache, v_cache = self.fetch_idx(
             q, kv_indptr, kv_indices,
             forward_batch.token_to_kv_pool,
             layer,
@@ -1158,8 +1197,10 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            # forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            k_cache,
+            # forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            v_cache,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,

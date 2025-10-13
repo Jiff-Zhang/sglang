@@ -166,6 +166,49 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
 
+class MFTokenToKVPool(KVCache):
+    @classmethod
+    def quantize(
+        cls,
+        buffer: torch.Tensor,
+        tool: MFSparseNbits,
+        loc: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor, # [B]
+    ):
+        if not tool.is_seq_rely:
+            buffer[loc] = quantize(buffer[loc], tool)
+            return
+            
+        is_decode = qo_indptr is None
+        for i in range(len(kv_indptr) - 1):
+            cur_len = kv_indptr[i + 1] - kv_indptr[i]
+            if is_decode:
+                ori_len = cur_len - 1
+                idx = kv_indices[kv_indptr[i]: kv_indptr[i + 1]]
+            else:
+                ori_len = cur_len
+                cur_len = cur_len + qo_indptr[i + 1] - qo_indptr[i]
+                idx = torch.cat(
+                    [
+                        kv_indices[kv_indptr[i]: kv_indptr[i + 1]],
+                        loc[qo_indptr[i]: qo_indptr[i + 1]]
+                    ],
+                    dim=0
+                )
+        ori_len = ori_len // tool.bank_size * tool.bank_size
+        cur_len = cur_len // tool.bank_size * tool.bank_size
+        if cur_len > ori_len:
+            buffer[idx[ori_len: cur_len]] = quantize(
+                buffer[idx[ori_len: cur_len]], tool
+            )
+
+    @abc.abstractmethod
+    def get_label_buffer(self, layer_id: int):
+        raise NotImplementedError()
+
+
 class MHATokenToKVPool(KVCache):
 
     def __init__(
@@ -423,6 +466,175 @@ class MHATokenToKVPool(KVCache):
             next_power_of_2(len(tgt_loc)),
         )
 
+class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        
+    def _create_buffers(self):
+        super()._create_buffers()
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # [size, head_num, head_dim] for each layer
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.label_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.label_buffer
+
+    def get_kv_size_bytes(self):
+        k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
+        assert hasattr(self, "label_buffer")
+        for label_cache in self.label_buffer:
+            k_size_bytes += np.prod(label_cache.shape) * label_cache.dtype.itemsize
+        return k_size_bytes, v_size_bytes
+    
+    def _get_label_buffer(self, layer_id: int):
+        # for internal use of referencing
+        if self.store_dtype != self.dtype:
+            return self.label_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.label_buffer[layer_id - self.start_layer]
+
+    def get_label_buffer(self, layer_id: int):
+        # note: get_label_buffer is hooked with synchronization for layer-wise KV cache loading
+        # it is supposed to be used only by attention backend not for information purpose
+        # same applies to get_value_buffer and get_kv_buffer
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        return self._get_label_buffer(layer_id)
+    
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor=None, # [B]
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        if get_is_capture_mode() and self.alt_stream is not None:
+            # Overlap the copy of K and V cache for small batch size
+            current_stream = self.device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            self.label_buffer[layer_id - self.start_layer][loc] = cache_k
+            with self.device_module.stream(self.alt_stream):
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            with self.device_module.stream(self.alt_stream):
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            self.label_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+        time_stamp = time.time()
+        if "retrieve" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.label_buffer[layer_id - self.start_layer],
+                layer.retriever.tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+            )
+        
+        if "cache_quant" in getattr(layer, 'modes', []):
+            self.quantize(
+                self.k_buffer[layer_id - self.start_layer],
+                layer.k_tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+            )
+            self.quantize(
+                self.v_buffer[layer_id - self.start_layer],
+                layer.v_tool,
+                loc=loc,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                qo_indptr=qo_indptr,
+            )
+
+        if get_attention_tp_rank() == 0 and \
+                layer.layer_id - self.start_layer == 0:
+            if qo_indptr is None:
+                cur_avg_len = 1
+                avg_len = len(kv_indices) / (len(kv_indptr) - 1)
+            else:
+                cur_avg_len = qo_indptr[-1].item() / (len(qo_indptr) - 1)
+                avg_len = (len(kv_indices) + len(cache_k)) / (len(kv_indptr) - 1)
+            time_used = time.time() - time_stamp
+            total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / len(self.k_buffer)
+            logger.debug(
+                f"<MFMHATokenToKVPool.set_kv_buffer> "
+                f"#time used: {time_used:.3f}s / {total_time_used:.3f}s, "
+                f"#modes: {getattr(layer, 'modes', [])}, "
+                f"#kv_to_cache.shape: {list(cache_k.shape)}, "
+                f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+                f"#kv_indices.shape: {list(kv_indices.shape)}, "
+                f"#kv_to_cache_avg_len: {cur_avg_len:.2f}, "
+                f"#kv_cache_avg_len: {avg_len:.2f}, "
+            )
+            self.time_stamp = time.time()
 
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
@@ -884,7 +1096,7 @@ class MLATokenToKVPool(KVCache):
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
 
-class MFMLATokenToKVPool(MLATokenToKVPool):
+class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -1003,43 +1215,6 @@ class MFMLATokenToKVPool(MLATokenToKVPool):
                 f"#kv_cache_avg_len: {avg_len:.2f}, "
             )
             self.time_stamp = time.time()
-
-    def quantize(
-        self,
-        buffer: torch.Tensor,
-        tool: MFSparseNbits,
-        loc: torch.Tensor,
-        kv_indptr: torch.Tensor, # [B]
-        kv_indices: torch.Tensor, # [S]
-        qo_indptr: torch.Tensor, # [B]
-    ):
-        if not tool.is_seq_rely:
-            buffer[loc] = quantize(buffer[loc], tool)
-            return
-            
-        is_decode = qo_indptr is None
-        for i in range(len(kv_indptr) - 1):
-            cur_len = kv_indptr[i + 1] - kv_indptr[i]
-            if is_decode:
-                ori_len = cur_len - 1
-                idx = kv_indices[kv_indptr[i]: kv_indptr[i + 1]]
-            else:
-                ori_len = cur_len
-                cur_len = cur_len + qo_indptr[i + 1] - qo_indptr[i]
-                idx = torch.cat(
-                    [
-                        kv_indices[kv_indptr[i]: kv_indptr[i + 1]],
-                        loc[qo_indptr[i]: qo_indptr[i + 1]]
-                    ],
-                    dim=0
-                )
-        ori_len = ori_len // tool.bank_size * tool.bank_size
-        cur_len = cur_len // tool.bank_size * tool.bank_size
-        if cur_len > ori_len:
-            buffer[idx[ori_len: cur_len]] = quantize(
-                buffer[idx[ori_len: cur_len]], tool
-            )
-
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
     def __init__(

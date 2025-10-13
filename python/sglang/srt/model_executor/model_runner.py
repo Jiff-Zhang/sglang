@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
+    MFMHATokenToKVPool,
     MLATokenToKVPool,
     MFMLATokenToKVPool,
     ReqToTokenPool,
@@ -1080,6 +1081,8 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if self.is_moffett:
+                cell_size *= 1.5
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -1361,7 +1364,11 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                self.token_to_kv_pool = MHATokenToKVPool(
+                if self.is_moffett:
+                    MHATokenToKVPoolClass = MFMHATokenToKVPool
+                else:
+                    MHATokenToKVPoolClass = MHATokenToKVPool
+                self.token_to_kv_pool = MHATokenToKVPoolClass(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
