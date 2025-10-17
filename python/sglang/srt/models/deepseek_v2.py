@@ -67,6 +67,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    is_logging_enabled
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -373,6 +374,11 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # if forward_batch.forward_mode.is_decode():
+    #     return AttnForwardMethod.MLA
+    # else:
+    #     return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
+    
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
@@ -1264,28 +1270,6 @@ class DeepseekV2AttentionMLA(nn.Module):
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch,
     ) -> AttnForwardMethod:
-        if forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA
-        else:
-            return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
-    
-        def _dispatch_mla_subtype():
-            if _is_hip:
-                if (
-                    self.rocm_fused_decode_mla
-                    and forward_batch.forward_mode.is_decode()
-                ):
-                    return AttnForwardMethod.MLA_FUSED_ROPE
-                else:
-                    return AttnForwardMethod.MLA
-            else:
-                if hasattr(self, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(
-                    self
-                ):
-                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-                else:
-                    return AttnForwardMethod.MLA
-
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = global_server_args_dict["decode_attention_backend"]
@@ -1384,10 +1368,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         
-        if get_attention_tp_rank() == 0 and self.layer_id == 0:
+        if is_logging_enabled() and self.layer_id == 0:
             logger.debug(
                 f"<DeepseekV2AttentionMLA.forward_prepare> "
-                f"#attn_forward_method: {attn_forward_method}, "
+                f"#attn_forward_method: {attn_forward_method, attn_forward_method.name}, "
                 f"#forward_mode: {forward_batch.forward_mode, forward_batch.forward_mode.is_decode()}, "
                 f"#hidden_states.shape: {list(hidden_states.shape)}, "
             )
@@ -1540,7 +1524,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             
         # k_r, v_r = self.mla2mha_cache(latent_cache)
-        # if get_attention_tp_rank() == 0 and self.layer_id == 0:
+        # if is_logging_enabled() and self.layer_id == 0:
         # # if True:
         #     logger.debug(
         #         f"<DeepseekV2AttentionMLA.forward_normal_prepare> "

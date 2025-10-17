@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 from sglang.srt.mf_tool import MFSparseNbits, quantize
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
+from sglang.srt.layers.dp_attention import is_logging_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -936,8 +936,7 @@ class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
                 qo_indptr=qo_indptr,
             )
 
-        if get_attention_tp_rank() == 0 and \
-                layer.layer_id - self.start_layer == 0:
+        if is_logging_enabled() and layer.layer_id - self.start_layer == 0:
             if qo_indptr is None:
                 cur_avg_len = 1
                 avg_len = len(kv_indices) / (len(kv_indptr) - 1)
@@ -1620,8 +1619,7 @@ class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
                 qo_indptr=qo_indptr,
             )
 
-        if get_attention_tp_rank() == 0 and \
-                layer.layer_id - layer.start_layer == 0:
+        if is_logging_enabled() and layer.layer_id - layer.start_layer == 0:
             if qo_indptr is None:
                 cur_avg_len = 1
                 avg_len = len(kv_indices) / (len(kv_indptr) - 1)

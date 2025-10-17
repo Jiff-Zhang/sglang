@@ -5,7 +5,7 @@ from sparseopt.attns.act_sparse_nbits import MFSparseNbits
 from sparseopt.attns.retriever import TokenSparseRetriever
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import is_logging_enabled
 
 def quantize(
     x: torch.Tensor, # [S, H, D]
@@ -118,7 +118,7 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
     setattr(layer, "v_cache_tool", v_cache_tool)
     setattr(layer, "retriever", retriever)
     setattr(layer, "num_kv_heads", num_kv_heads)
-    if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+    if is_logging_enabled() and layer.layer_id == 0:
         print(f"### modes ###")
         print(modes)
         print(f"### retriever ###")

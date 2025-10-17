@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    is_logging_enabled,
 )
 
 from sglang.srt.mem_cache.memory_pool import MFTokenToKVPool
@@ -813,7 +814,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices = torch.arange(
             k_cache_n.size(0), device=kv_indices.device, dtype=kv_indices.dtype
         )
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if is_logging_enabled() and layer.layer_id == 0:
             logger.debug(
                 f"<TritonAttnBackend.kv_cache_transfer> "
                 f"#time used: {time.time() - time_stamp:.3f}s, "
@@ -879,7 +880,7 @@ class TritonAttnBackend(AttentionBackend):
             k_cache.size(0), device=kv_indices.device, dtype=kv_indices.dtype
         )
         
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if is_logging_enabled() and layer.layer_id == 0:
             time_used = time.time() - time_stamp
             total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / getattr(self, 'layer_num', 1)
             logger.debug(
@@ -990,7 +991,7 @@ class TritonAttnBackend(AttentionBackend):
                 layer=layer,
             )
 
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if is_logging_enabled() and layer.layer_id == 0:
             logger.debug(
                 f"<TritonAttnBackend.forward_extend> "
                 f"#window_kv_offsets: {window_kv_offsets}, "
@@ -1182,7 +1183,7 @@ class TritonAttnBackend(AttentionBackend):
             # reset retriever
             retriever._reset()
         
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if is_logging_enabled() and layer.layer_id == 0:
             self.layer_num = len(token_to_kv_pool.get_label_buffer(0))
             time_used = time.time() - time_stamp
             total_time_used = (time.time() - getattr(self, 'time_stamp', time.time())) / getattr(self, 'layer_num', 1)
@@ -1257,7 +1258,7 @@ class TritonAttnBackend(AttentionBackend):
             layer,
         )
 
-        if get_attention_tp_rank() == 0 and layer.layer_id == 0:
+        if is_logging_enabled() and layer.layer_id == 0:
             logger.debug(
                 f"<TritonAttnBackend.forward_decode> "
                 f"#q.shape: {list(q.shape)}, "
