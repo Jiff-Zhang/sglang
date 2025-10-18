@@ -48,6 +48,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.utils import dump_to_file, use_intel_amx_backend
 
+from sglang.srt.mf_tool import save as mf_save
+
 logger = logging.getLogger(__name__)
 
 
@@ -324,6 +326,12 @@ class LogitsProcessor(nn.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+        mf_save(
+            logits,
+            name=f"logits",
+            layer_id=None,
+            gather=False,
+        )
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
