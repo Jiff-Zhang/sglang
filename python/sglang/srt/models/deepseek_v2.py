@@ -1415,7 +1415,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             logger.debug(
                 f"<DeepseekV2AttentionMLA.forward_prepare> "
                 f"#attn_forward_method: {attn_forward_method, attn_forward_method.name}, "
-                f"#forward_mode: {forward_batch.forward_mode, forward_batch.forward_mode.is_decode()}, "
+                f"#forward_mode: {forward_batch.forward_mode, forward_batch.forward_mode.name, forward_batch.forward_mode.is_decode()}, "
                 f"#hidden_states.shape: {list(hidden_states.shape)}, "
             )
 
@@ -1545,7 +1545,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             # Save latent cache
             if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
-                assert isinstance(forward_batch.attn_backend, TritonAttnBackend), f"MFMLATokenToKVPool only supports TritonAttnBackend"
+                assert isinstance(forward_batch.attn_backend, TritonAttnBackend), f"MFMLATokenToKVPool only supports TritonAttnBackend, but got {type(forward_batch.attn_backend)}"
                 _, kv_indptr, kv_indices, _ = forward_batch.attn_backend.get_extend_metadata(self.attn_mha)
                 qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1739,6 +1739,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
+            if is_logging_enabled() and self.layer_id == 0:
+                logger.debug(f"topk_indices: {topk_indices.shape if topk_indices is not None else None}")
 
         return (
             q_pe,

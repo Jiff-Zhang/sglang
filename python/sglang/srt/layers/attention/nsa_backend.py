@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 
@@ -29,7 +30,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+from sglang.srt.mf_tool import is_logging_enabled
+
 _is_hip = is_hip()
+logger = logging.getLogger(__name__)
 
 if _is_hip:
     try:
@@ -531,6 +535,17 @@ class NativeSparseAttnBackend(AttentionBackend):
                 extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                 page_size=1,
             )
+
+        if is_logging_enabled() and layer.layer_id == 0:
+            logger.debug(
+                f"<NativeSparseAttnBackend.forward_extend> "
+                f"#NSA_PREFILL_IMPL: {NSA_PREFILL_IMPL}, "
+                f"#q_rope.shape: {list(q_rope.shape)}, "
+                f"#q_nope.shape: {list(q_nope.shape)}, "
+                f"#kv_cache.shape: {list(kv_cache.shape)}, "
+                f"#page_table_1.shape: {list(page_table_1.shape)}"
+            )
+        
         if NSA_PREFILL_IMPL == "tilelang":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -635,6 +650,16 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_size=1,
             )
 
+        if is_logging_enabled() and layer.layer_id == 0:
+            logger.debug(
+                f"<NativeSparseAttnBackend.forward_decode> "
+                f"#NSA_DECODE_IMPL: {NSA_DECODE_IMPL}, "
+                f"#q_rope.shape: {list(q_rope.shape)}, "
+                f"#q_nope.shape: {list(q_nope.shape)}, "
+                f"#kv_cache.shape: {list(kv_cache.shape)}, "
+                f"#page_table_1.shape: {list(page_table_1.shape)}"
+            )
+            
         if NSA_DECODE_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)

@@ -28,6 +28,8 @@ def quantize(
     )
 
 def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
+    return
+
     assert isinstance(layer, RadixAttention), f"layer must be an instance of RadixAttention, got {type(layer)}"
     assert num_kv_heads > 0, f"num_kv_heads must be > 0, got {num_kv_heads}"
     
