@@ -64,6 +64,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
@@ -75,18 +76,11 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import (
-    deep_gemm_wrapper,
-    monkey_patch_isinstance_for_vllm_base_layer,
-)
+from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import (
-    GLOBAL_SERVER_ARGS_KEYS,
-    global_server_args_dict,
-)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -110,11 +104,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -127,7 +117,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -148,6 +142,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
+    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
@@ -176,11 +171,28 @@ MLA_ATTENTION_BACKENDS = [
     "nsa",
 ]
 
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutlass_mla",
+    "trtllm_mla",
+]
+
 
 def add_mla_attention_backend(backend_name):
     if backend_name not in MLA_ATTENTION_BACKENDS:
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
 
 
 _is_hip = is_hip()
@@ -197,7 +209,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 
 logger = logging.getLogger(__name__)
-
 
 if _is_npu:
     import torch_npu
@@ -274,25 +285,21 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.init_new_workspace = False
 
         # Apply the rank zero filter to logger
-        if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
-            logger.addFilter(RankZeroFilter(tp_rank == 0))
         if server_args.show_time_cost:
             enable_show_time_cost()
 
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Global vars
-        global_server_args_dict.update(
-            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-            | {
-                # TODO it is indeed not a "server args"
-                "use_mla_backend": self.use_mla_backend,
-                "speculative_algorithm": self.spec_algorithm,
-            }
-        )
+        # Set the global server_args in the scheduler process
+        set_global_server_args_for_scheduler(server_args)
+        global_server_args = get_global_server_args()
+
+        # FIXME: hacky set `use_mla_backend`
+        global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -425,7 +432,7 @@ class ModelRunner:
         # In layered loading, torchao may have been applied
         if not torchao_applied:
             apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
+                self.model, get_global_server_args().torchao_config
             )
 
         # Apply torch TP if the model supports it
@@ -570,8 +577,9 @@ class ModelRunner:
                     server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = "triton"
-            logger.info(
-                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
+            log_info_on_rank0(
+                logger,
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default.",
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -614,11 +622,15 @@ class ModelRunner:
                     f"{self.model_config.hf_config.model_type}"
                 )
 
-        if not self.use_mla_backend:
+        if (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
@@ -645,6 +657,23 @@ class ModelRunner:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
+        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
+            if (
+                quantization_config := getattr(
+                    self.model_config.hf_config, "quantization_config", None
+                )
+            ) is not None:
+                text_config = self.model_config.hf_text_config
+                weight_block_size_n = quantization_config["weight_block_size"][0]
+                if (
+                    text_config.moe_intermediate_size
+                    // (self.tp_size // self.moe_ep_size)
+                ) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
+                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
+                    )
+
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -657,7 +686,18 @@ class ModelRunner:
             raise
 
         if self.device == "cuda":
-            backend = "nccl"
+            if self.server_args.elastic_ep_backend == "mooncake":
+                backend = "mooncake"
+                if self.server_args.mooncake_ib_device:
+                    mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                    try:
+                        from mooncake import ep as mooncake_ep
+
+                        mooncake_ep.set_device_filter(mooncake_ib_device)
+                    except:
+                        pass  # A warning will be raised in `init_distributed_environment`
+            else:
+                backend = "nccl"
         elif self.device == "xpu":
             backend = "xccl"
         elif self.device == "hpu":
@@ -865,17 +905,32 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+        # Pre-expand RoPE cache before CUDA Graph capture
+        reserve_rope_cache_for_long_sequences(
+            self.model,
+            self.server_args,
+            self.model_config,
+            self.req_to_token_pool,
+            logger,
+        )
+
+        if self.server_args.elastic_ep_backend == "mooncake":
+            # Mooncake does not support `monitored_barrier`
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            # Handle the case where some ranks do not finish loading.
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
 
     def update_expert_location(
         self,
@@ -1532,6 +1587,8 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -1629,19 +1686,34 @@ class ModelRunner:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
-                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+                from sglang.srt.disaggregation.decode import (
+                    DecodeReqToTokenPool,
+                    HybridMambaDecodeReqToTokenPool,
+                )
 
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
-                self.req_to_token_pool = DecodeReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    pre_alloc_size=pre_alloc_size,
-                )
+                if config := self.mambaish_config:
+                    self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        cache_params=config.mamba2_cache_params,
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        pre_alloc_size=pre_alloc_size,
+                    )
+                else:
+                    self.req_to_token_pool = DecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        pre_alloc_size=pre_alloc_size,
+                    )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
@@ -1771,6 +1843,7 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
                 )
             else:
                 if self.is_moffett:
@@ -1897,12 +1970,10 @@ class ModelRunner:
                 self.server_args.attention_backend
             )
 
-        global_server_args_dict.update(
-            {
-                "decode_attention_backend": self.decode_attention_backend_str,
-                "prefill_attention_backend": self.prefill_attention_backend_str,
-            }
-        )
+        (
+            get_global_server_args().prefill_attention_backend,
+            get_global_server_args().decode_attention_backend,
+        ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
