@@ -1700,7 +1700,7 @@ class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
                 qo_indptr=qo_indptr,
             )
 
-        if is_logging_enabled() and layer.layer_id - layer.start_layer == 0:
+        if is_logging_enabled() and layer.layer_id - self.start_layer == 0:
             if qo_indptr is None:
                 cur_avg_len = 1
                 avg_len = len(kv_indices) / (len(kv_indptr) - 1)

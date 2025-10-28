@@ -543,7 +543,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 f"#q_rope.shape: {list(q_rope.shape)}, "
                 f"#q_nope.shape: {list(q_nope.shape)}, "
                 f"#kv_cache.shape: {list(kv_cache.shape)}, "
-                f"#page_table_1.shape: {list(page_table_1.shape)}"
+                f"#page_table_1.shape: {list(page_table_1.shape)}, "
+                # f"#page_table_1[:2]: {page_table_1[:2]}, "
+                # f"#metadata: {metadata}, "
             )
         
         if NSA_PREFILL_IMPL == "tilelang":
@@ -657,7 +659,8 @@ class NativeSparseAttnBackend(AttentionBackend):
                 f"#q_rope.shape: {list(q_rope.shape)}, "
                 f"#q_nope.shape: {list(q_nope.shape)}, "
                 f"#kv_cache.shape: {list(kv_cache.shape)}, "
-                f"#page_table_1.shape: {list(page_table_1.shape)}"
+                f"#page_table_1.shape: {list(page_table_1.shape)}, "
+                # f"#metadata: {metadata}, "
             )
             
         if NSA_DECODE_IMPL == "flashmla_prefill":

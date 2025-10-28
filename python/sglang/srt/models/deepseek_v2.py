@@ -382,10 +382,14 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
-    # if forward_batch.forward_mode.is_decode():
-    #     return AttnForwardMethod.MLA
-    # else:
-    #     return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
+    # TODO: support prefill retrieve
+    if "prefill_retrieve" in getattr(attn.attn_mha, "modes", []):
+        return AttnForwardMethod.MLA
+    
+    if forward_batch.forward_mode.is_decode():
+        return AttnForwardMethod.MLA
+    else:
+        return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
     
     if (
         _is_extend_without_speculative(forward_batch)
@@ -1739,8 +1743,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
-            if is_logging_enabled() and self.layer_id == 0:
-                logger.debug(f"topk_indices: {topk_indices.shape if topk_indices is not None else None}")
+            # if is_logging_enabled() and self.layer_id == 0:
+            #     logger.debug(f"topk_indices: {topk_indices.shape if topk_indices is not None else None}")
 
         return (
             q_pe,

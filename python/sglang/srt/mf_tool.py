@@ -1,11 +1,14 @@
 import math
 import torch
+import logging
 
 from sparseopt.attns.act_sparse_nbits import MFSparseNbits
 from sparseopt.attns.retriever import TokenSparseRetriever
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.dp_attention import is_logging_enabled
+from sglang.srt.layers.dp_attention import is_logging_enabled, is_dp_attention_enabled
+
+logger = logging.getLogger(__name__)
 
 def quantize(
     x: torch.Tensor, # [S, H, D]
@@ -28,7 +31,7 @@ def quantize(
     )
 
 def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
-    return
+    # return
 
     assert isinstance(layer, RadixAttention), f"layer must be an instance of RadixAttention, got {type(layer)}"
     assert num_kv_heads > 0, f"num_kv_heads must be > 0, got {num_kv_heads}"
@@ -38,7 +41,8 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
     modes = [
         # "prefill_quant",    # whether to quantize key/value/query/score when prefill
         # "cache_quant",      # whether to quantize cached key & value
-        # "retrieve",         # whether to quantize cached key and retrieve tokens when decode
+        "prefill_retrieve", # whether to quantize cached key and retrieve tokens when prefill
+        "retrieve",         # whether to quantize cached key and retrieve tokens when decode
     ]
 
     per_bank_tool = MFSparseNbits(
@@ -108,7 +112,7 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
         # # topk_mini_k=256,
         # topk_mini_k=-1,
         # topk_chunk_size=4096,
-        all_reduce=num_kv_heads == 1,
+        all_reduce=num_kv_heads == 1 and not is_dp_attention_enabled(),
         auto_reset=False,
         qk_scaling=layer.scaling, # TODO: unmark code for scaling
     )
@@ -121,17 +125,13 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
     setattr(layer, "retriever", retriever)
     setattr(layer, "num_kv_heads", num_kv_heads)
     if is_logging_enabled() and layer.layer_id == 0:
-        print(f"### modes ###")
-        print(modes)
-        print(f"### retriever ###")
-        retriever.print_stats()
-        print(f"### q_tool ###")
-        q_tool.print_stats()
-        print(f"### k_tool ###")
-        k_tool.print_stats()
-        print(f"### v_tool ###")
-        v_tool.print_stats()
-        print(f"### k_cache_tool ###")
-        k_cache_tool.print_stats()
-        print(f"### v_cache_tool ###")
-        v_cache_tool.print_stats()
+        logger.debug(
+            f"<register_mf_tool> \n"
+            f"\t#modes: {modes}\n"
+            f"\t#retriever: {retriever.stats_str}\n"
+            f"\t#q_tool: {q_tool.stats_str}\n"
+            f"\t#k_tool: {k_tool.stats_str}\n"
+            f"\t#v_tool: {v_tool.stats_str}\n"
+            f"\t#k_cache_tool: {k_cache_tool.stats_str}\n"
+            f"\t#v_cache_tool: {v_cache_tool.stats_str}"
+        )
