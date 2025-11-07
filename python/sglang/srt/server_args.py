@@ -217,6 +217,7 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
+    prefill_only_one_req: bool = False
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     schedule_low_priority_values_first: bool = False
@@ -1698,6 +1699,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--prefill-only-one-req",
+            default=ServerArgs.prefill_only_one_req,
+            action="store_true",
+            help="If true, then only prefill one request at each prefill batch",
         )
         parser.add_argument(
             "--schedule-policy",

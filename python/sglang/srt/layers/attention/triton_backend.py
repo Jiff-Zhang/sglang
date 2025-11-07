@@ -1136,6 +1136,21 @@ class TritonAttnBackend(AttentionBackend):
             q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             assert hasattr(layer, 'retriever'), f"layer {layer.layer_id} does not have retriever"
             
+            if is_logging_enabled() and layer.layer_id == 0:
+                logger.debug(
+                    f"<TritonAttnBackend.forward_extend> "
+                    f"#window_kv_offsets: {window_kv_offsets}, "
+                    f"#q.shape: {list(q.shape)}, "
+                    f"#k.shape: {list(k.shape)}, "
+                    f"#v.shape: {list(v.shape)}, "
+                    f"#k_cache.shape: {list(k_cache.shape)}, "
+                    f"#v_cache.shape: {list(v_cache.shape)}, "
+                    f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+                    f"#kv_indptr: {kv_indptr.tolist()}, "
+                    f"#kv_indices.shape: {list(kv_indices.shape)}, "
+                    f"#qo_indptr.shape: {list(self.forward_metadata.qo_indptr.shape)}, "
+                )
+            
             label_k_cache = forward_batch.token_to_kv_pool.get_label_buffer(layer.layer_id)
             self.extend_attention_fwd(
                 # q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

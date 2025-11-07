@@ -2013,7 +2013,7 @@ class Scheduler(
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
-
+                    
             if self.running_batch.batch_is_full:
                 if not self.try_preemption:
                     break
@@ -2025,14 +2025,19 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
-
+                
+            # # TODO: prefill only one request
+            if self.server_args.prefill_only_one_req and \
+                    len(adder.can_run_list) >= 1:
+                break
+                
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
-
+            
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:

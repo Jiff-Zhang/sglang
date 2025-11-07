@@ -586,13 +586,17 @@ def extend_attention_fwd(
         qk_scores = qk_scores.contiguous()
         label_extend = prefill_retrieve_config["k"]
         label_buffer = prefill_retrieve_config["k_cache"]
+        retriever = prefill_retrieve_config["retriever"]
+        # quantize q_extend for retriever
+        q_extend_re = retriever.q_tool(q_extend).contiguous()
     else:
         qk_scores = None
         label_extend = None
         label_buffer = None
+        q_extend_re = None
 
     _fwd_kernel[grid](
-        q_extend,
+        q_extend_re if prefill_retrieve else q_extend,
         label_extend if  prefill_retrieve else k_extend,
         v_extend,
         o_extend,
