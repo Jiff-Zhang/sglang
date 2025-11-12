@@ -402,8 +402,8 @@ def w8a8_block_int8_matmul(
         # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
+            "BLOCK_SIZE_N": max(block_size[0], 128),
+            "BLOCK_SIZE_K": max(block_size[1], 128),
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
             "num_stages": 3,
