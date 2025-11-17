@@ -252,8 +252,8 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # TODO: Whether to use Moffett tool, temporarily active when using MLATokenToKVPool
-        # self.is_moffett = False
-        self.is_moffett = True
+        self.is_moffett = False
+        # self.is_moffett = True
         
         # Parse args
         self.mem_fraction_static = mem_fraction_static
