@@ -202,6 +202,7 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.tp_size = tp_size
         self.layer_id = layer_id
+        self.prefix = prefix
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -242,7 +243,7 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         mf_save(
             gate_up,
-            name=f"mlp-gate_up",
+            name=f"mlp-moe-shared_experts-gate_up" if "shared_experts" in self.prefix else f"mlp-gate_up",
             layer_id=self.layer_id,
             gather=True,
             dim=-1,
@@ -251,7 +252,7 @@ class DeepseekV2MLP(nn.Module):
         x = self.act_fn(gate_up)
         mf_save(
             x,
-            name=f"mlp-act_fn",
+            name=f"mlp-moe-shared_experts-act_fn" if "shared_experts" in self.prefix else f"mlp-act_fn",
             layer_id=self.layer_id,
             gather=True,
             dim=-1,
@@ -262,7 +263,7 @@ class DeepseekV2MLP(nn.Module):
         )
         mf_save(
             x,
-            name=f"mlp-down_proj",
+            name=f"mlp-moe-shared_experts-down_proj" if "shared_experts" in self.prefix else f"mlp-down_proj",
             layer_id=self.layer_id,
             gather=False,
         )
@@ -394,6 +395,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                layer_id=self.layer_id,
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
@@ -505,7 +507,7 @@ class DeepseekV2MoE(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
-
+        
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -514,9 +516,51 @@ class DeepseekV2MoE(nn.Module):
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
 
+        mf_save(
+            topk_output.router_logits,
+            name=f"mlp-moe-gate",
+            layer_id=self.layer_id,
+            gather=False,
+        )
+        mf_save(
+            topk_output.topk_ids,
+            name=f"mlp-moe-topk_ids",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            topk_output.topk_weights,
+            name=f"mlp-moe-topk_weights",
+            layer_id=self.layer_id,
+            gather=False
+        )
+
         current_stream.wait_stream(self.alt_stream)
         with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
+            
+        shared_experts_output = shared_output.clone()
+        fused_experts_output = final_hidden_states.clone()
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            shared_experts_output = tensor_model_parallel_all_reduce(shared_experts_output)
+            fused_experts_output = tensor_model_parallel_all_reduce(fused_experts_output)
+        mf_save(
+            shared_experts_output,
+            name=f"mlp-moe-shared-experts",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            fused_experts_output,
+            name=f"mlp-moe-fused-experts",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
@@ -528,6 +572,12 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        mf_save(
+            final_hidden_states,
+            name=f"mlp-moe-all_reduce",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return final_hidden_states
 
     def forward_normal(
@@ -549,6 +599,23 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        if shared_output is not None:
+            shared_experts_output = shared_output.clone()
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                shared_experts_output = tensor_model_parallel_all_reduce(shared_experts_output)
+            mf_save(
+                shared_experts_output,
+                name=f"mlp-moe-shared-experts",
+                layer_id=self.layer_id,
+                gather=False
+            )
+            
         mf_save(
             topk_output.router_logits,
             name=f"mlp-moe-gate",
@@ -569,12 +636,22 @@ class DeepseekV2MoE(nn.Module):
         )
 
         final_hidden_states = self.experts(hidden_states, topk_output)
+        
+        fused_experts_output = final_hidden_states.clone()
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            fused_experts_output = tensor_model_parallel_all_reduce(fused_experts_output)
         mf_save(
-            final_hidden_states,
+            fused_experts_output,
             name=f"mlp-moe-fused-experts",
             layer_id=self.layer_id,
             gather=False
         )
+        
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
