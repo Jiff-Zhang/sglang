@@ -1596,6 +1596,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_PREFILL:
             inner_state = self.forward_normal_chunked_kv_prefill_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
