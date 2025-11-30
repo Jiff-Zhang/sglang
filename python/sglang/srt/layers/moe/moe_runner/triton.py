@@ -98,6 +98,8 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     w2_zp: Optional[torch.Tensor] = None
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
+    a13_smooth_scale: Optional[torch.Tensor] = None # activation smooth scale
+    a2_smooth_scale: Optional[torch.Tensor] = None # activation smooth scale
     block_shape: Optional[List[int]] = None
 
 

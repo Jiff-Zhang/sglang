@@ -1,3 +1,4 @@
+import math
 import functools
 import json
 import logging
@@ -402,40 +403,64 @@ def w8a8_block_int8_matmul(
         # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": max(block_size[0], 128),
-            "BLOCK_SIZE_K": max(block_size[1], 128),
+            "BLOCK_SIZE_N": max(block_size[0], 16),
+            "BLOCK_SIZE_K": max(block_size[1], 16),
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
             "num_stages": 3,
         }
 
+    # split A and C to avoid illegal memory access
+    index_max = torch.iinfo(torch.int32).max
+    n_split = max(
+        math.ceil(A.numel() / index_max),
+        # only split in A and C to maintain contiguous memory
+        # math.ceil(B.numel() / index_max),
+        math.ceil(C.numel() / index_max),
+        1
+    )
+    split_size = max(A.size(0) // n_split, config["BLOCK_SIZE_M"])
+    split_size = split_size // config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_M"]
+    n_split = math.ceil(A.size(0) / split_size)
+    
+    A_list = [A[i*split_size:(i+1)*split_size] for i in range(n_split)]
+    As_list = [As[i*split_size:(i+1)*split_size] for i in range(n_split)]
+    B_list = [B for i in range(n_split)]
+    Bs_list = [Bs for i in range(n_split)]
+    C_list = [C[i*split_size:(i+1)*split_size] for i in range(n_split)]
+    M_list = [A_p.numel() // A_p.shape[-1] for A_p in A_list]
+
     def grid(META):
         return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            # triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            triton.cdiv(META["M"], META["BLOCK_SIZE_M"]) * \
+                triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),
         )
 
-    _w8a8_block_int8_matmul[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        **config,
-    )
+    for A_p, As_p, B_p, Bs_p, C_p, M_p in \
+            zip(A_list, As_list, B_list, Bs_list, C_list, M_list):
+        _w8a8_block_int8_matmul[grid](
+            A_p,
+            B_p,
+            C_p,
+            As_p,
+            Bs_p,
+            M_p,
+            N,
+            K,
+            block_n,
+            block_k,
+            A_p.stride(-2),
+            A_p.stride(-1),
+            B_p.stride(1),
+            B_p.stride(0),
+            C_p.stride(-2),
+            C_p.stride(-1),
+            As_p.stride(-2),
+            As_p.stride(-1),
+            Bs_p.stride(1),
+            Bs_p.stride(0),
+            **config,
+        )
 
     return C

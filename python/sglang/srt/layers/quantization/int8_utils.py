@@ -15,13 +15,27 @@ def apply_w8a8_block_int8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    mf_format: bool = False
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
+    if mf_format:
+        from sparseopt.attns.act_sparse_nbits import QuantTool
+        tool = QuantTool(
+            mode="per_bank",
+            dtype="int8",
+            bank_size=block_size[1],
+            symmetric=True
+        )
+        input_2d_n = tool.transform.preprocess(input_2d)
+        q_input, x_scale = tool.sym_quant(input_2d_n)
+        q_input = tool.transform.postprocess(q_input).to(torch.int8)
+        x_scale = tool.transform.postprocess(x_scale)
+    else:
+        q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
     output = w8a8_block_int8_matmul(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
     )

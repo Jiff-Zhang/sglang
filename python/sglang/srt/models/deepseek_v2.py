@@ -2864,7 +2864,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             # Save latent cache
             if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
-                assert isinstance(forward_batch.attn_backend, TritonAttnBackend), f"MFMLATokenToKVPool only supports TritonAttnBackend, but got {type(forward_batch.attn_backend)}"
+                assert isinstance(
+                    forward_batch.attn_backend, TritonAttnBackend
+                ), f"MFMLATokenToKVPool only supports TritonAttnBackend, but got {type(forward_batch.attn_backend)}"
                 _, kv_indptr, kv_indices, _ = forward_batch.attn_backend.get_extend_metadata(self.attn_mha)
                 qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -4036,6 +4038,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
+                    # print(name, param.size(), loaded_weight.size(), shard_id)
+                    # weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
                     for mapping in expert_params_mapping:
@@ -4064,6 +4068,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 "expert_id": expert_id,
                             },
                         )
+                        # print(name, param.size(), loaded_weight.size(), shard_id, expert_id)
+                        # weight_loader(param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id)
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
@@ -4097,16 +4103,23 @@ class DeepseekV2ForCausalLM(nn.Module):
                             ):
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
+                                if q_a_proj_name.endswith(".smooth_scale"):
+                                    # TODO: check if smooth scale is the same
+                                    assert torch.allclose(
+                                        q_a_proj_weight, kv_a_proj_weight
+                                    ), f"Smooth scale of q_a_proj and kv_a_proj_with_mqa should be the same."
+                                    fused_weight = q_a_proj_weight
+                                else:
+                                    cat_dim = 0
+                                    if self.quant_config is not None and (
+                                        self.quant_config.get_name() == "awq"
+                                        or self.quant_config.get_name() == "awq_marlin"
+                                        or self.quant_config.get_name() == "moe_wna16"
+                                    ):
+                                        cat_dim = 1
+                                    fused_weight = torch.cat(
+                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                    )
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"
@@ -4129,6 +4142,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
+                                # print(name, param.size(), fused_weight.size())
+                                # weight_loader(param, fused_weight)
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
                         else:
@@ -4159,6 +4174,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
                             )
+                            # print(name, param.size(), loaded_weight.size())
+                            # weight_loader(param, loaded_weight)
 
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):

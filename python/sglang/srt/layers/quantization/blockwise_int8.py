@@ -11,7 +11,7 @@ from torch.nn import Module
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, RowvLLMParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -43,6 +43,8 @@ class BlockInt8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        smooth: bool = False,
+        mf_format: bool = False,
     ) -> None:
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         if is_checkpoint_int8_serialized:
@@ -68,6 +70,8 @@ class BlockInt8Config(QuantizationConfig):
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
+        self.smooth = smooth
+        self.mf_format = mf_format
 
     @classmethod
     def get_name(cls) -> str:
@@ -92,11 +96,15 @@ class BlockInt8Config(QuantizationConfig):
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        smooth = cls.get_from_keys_or(config, ["smooth"], False)
+        mf_format = cls.get_from_keys_or(config, ["mf_format"], False)
         return cls(
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            smooth=smooth,
+            mf_format=mf_format,
         )
 
     def get_quant_method(
@@ -215,6 +223,20 @@ class BlockInt8LinearMethod(LinearMethodBase):
         assert self.quant_config.activation_scheme == "dynamic"
         layer.register_parameter("input_scale", None)
 
+        # SMOOTH SCALE
+        if self.quant_config.smooth:
+            smooth_scale = RowvLLMParameter(
+                data=torch.empty(
+                    1,
+                    input_size_per_partition,
+                    dtype=torch.bfloat16,
+                ),
+                input_dim=1,
+                weight_loader=weight_loader,
+            )
+            smooth_scale[:] = torch.finfo(torch.bfloat16).min
+            layer.register_parameter("smooth_scale", smooth_scale)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         # Use torch Parameter to avoid cuda graph capturing issue
@@ -229,6 +251,9 @@ class BlockInt8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.quant_config.smooth:
+            x = x / layer.smooth_scale
+        
         return apply_w8a8_block_int8_linear(
             input=x,
             weight=layer.weight,
@@ -236,6 +261,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale_inv,
             input_scale=None,
             bias=bias,
+            mf_format=self.quant_config.mf_format
         )
 
 
@@ -350,6 +376,36 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # SMOOTH SCALE
+        # TODO: to be fixed
+        # if self.quant_config.smooth:
+        if False:
+            w13_smooth_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    1,
+                    hidden_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_smooth_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    1,
+                    intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_smooth_scale", w13_smooth_scale)
+            layer.register_parameter("w2_smooth_scale", w2_smooth_scale)
+            set_weight_attrs(w13_smooth_scale, extra_weight_attrs)
+            set_weight_attrs(w2_smooth_scale, extra_weight_attrs)
+        else:
+            layer.w13_smooth_scale = None
+            layer.w2_smooth_scale = None
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         return
@@ -374,6 +430,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale_inv,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            a13_smooth_scale=layer.w13_smooth_scale,
+            a2_smooth_scale=layer.w2_smooth_scale,
             block_shape=self.quant_config.weight_block_size,
         )
 
