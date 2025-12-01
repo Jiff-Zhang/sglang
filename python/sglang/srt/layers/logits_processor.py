@@ -49,6 +49,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu, use_intel_amx_backend
 
+from sglang.srt.mf_tool import save as mf_save
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -523,6 +525,12 @@ class LogitsProcessor(nn.Module):
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            mf_save(
+                logits,
+                name=f"logits",
+                layer_id=None,
+                gather=False,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -564,6 +572,12 @@ class LogitsProcessor(nn.Module):
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            mf_save(
+                logits,
+                name=f"logits",
+                layer_id=None,
+                gather=False,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )

@@ -163,7 +163,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
-from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, register_mf_tool
+from sglang.srt.mf_tool import register_mf_tool, save as mf_save
 from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
@@ -499,12 +499,15 @@ class DeepseekV2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        layer_id: Optional[int] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
+        self.layer_id = layer_id
+        self.prefix = prefix
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -554,10 +557,32 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
+        mf_save(
+            gate_up,
+            name=f"mlp-moe-shared_experts-gate_up" if "shared_experts" in self.prefix else f"mlp-gate_up",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=2
+        )
         x = self.act_fn(gate_up)
+        mf_save(
+            x,
+            name=f"mlp-moe-shared_experts-act_fn" if "shared_experts" in self.prefix else f"mlp-act_fn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+        )
+        mf_save(
+            x,
+            name=f"mlp-moe-shared_experts-down_proj" if "shared_experts" in self.prefix else f"mlp-down_proj",
+            layer_id=self.layer_id,
+            gather=False,
         )
         return x
 
@@ -734,6 +759,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                layer_id=self.layer_id,
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
@@ -852,7 +878,50 @@ class DeepseekV2MoE(nn.Module):
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
+        mf_save(
+            topk_output.router_logits,
+            name=f"mlp-moe-gate",
+            layer_id=self.layer_id,
+            gather=False,
+        )
+        mf_save(
+            topk_output.topk_ids,
+            name=f"mlp-moe-topk_ids",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            topk_output.topk_weights,
+            name=f"mlp-moe-topk_weights",
+            layer_id=self.layer_id,
+            gather=False
+        )
+
         current_stream.wait_stream(self.alt_stream)
+        
+        shared_experts_output = shared_output.clone()
+        fused_experts_output = final_hidden_states.clone()
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            shared_experts_output = tensor_model_parallel_all_reduce(shared_experts_output)
+            fused_experts_output = tensor_model_parallel_all_reduce(fused_experts_output)
+        mf_save(
+            shared_experts_output,
+            name=f"mlp-moe-shared-experts",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            fused_experts_output,
+            name=f"mlp-moe-fused-experts",
+            layer_id=self.layer_id,
+            gather=False
+        )
+
         final_hidden_states += shared_output
         if (
             self.tp_size > 1
@@ -861,6 +930,12 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        mf_save(
+            final_hidden_states,
+            name=f"mlp-moe-all_reduce",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return final_hidden_states
 
     def forward_normal(
@@ -888,6 +963,41 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+        
+        if shared_output is not None:
+            shared_experts_output = shared_output.clone()
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                shared_experts_output = tensor_model_parallel_all_reduce(shared_experts_output)
+            mf_save(
+                shared_experts_output,
+                name=f"mlp-moe-shared-experts",
+                layer_id=self.layer_id,
+                gather=False
+            )
+            
+        mf_save(
+            topk_output.router_logits,
+            name=f"mlp-moe-gate",
+            layer_id=self.layer_id,
+            gather=False,
+        )
+        mf_save(
+            topk_output.topk_ids,
+            name=f"mlp-moe-topk_ids",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            topk_output.topk_weights,
+            name=f"mlp-moe-topk_weights",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -923,6 +1033,22 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+        
+        fused_experts_output = final_hidden_states.clone()
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            fused_experts_output = tensor_model_parallel_all_reduce(fused_experts_output)
+        mf_save(
+            fused_experts_output,
+            name=f"mlp-moe-fused-experts",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        
         if (
             not _is_cuda
             and not _use_aiter
@@ -939,6 +1065,12 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        mf_save(
+            final_hidden_states,
+            name=f"mlp-moe-all_reduce",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return final_hidden_states
 
     def forward_cpu(
@@ -1701,11 +1833,40 @@ class DeepseekV2AttentionMLA(nn.Module):
                     dim=-1,
                 )
             )
-
+            
+            mf_save(
+                q,
+                name=f"attn-q_c",
+                layer_id=self.layer_id,
+                gather=True,
+                dim=-1,
+                nt=1
+            )
+            mf_save(
+                latent_cache[..., :self.kv_lora_rank],
+                name=f"attn-kv_c",
+                layer_id=self.layer_id,
+                gather=False
+            )
+            mf_save(
+                latent_cache[..., self.kv_lora_rank:],
+                name=f"attn-kv_pe",
+                layer_id=self.layer_id,
+                gather=False
+            )
+            
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
             if self.use_nsa:
                 q_lora = self.q_a_layernorm(q)
+                mf_save(
+                    self.q_b_proj(q_lora)[0],
+                    name=f"attn-q_b_proj",
+                    layer_id=self.layer_id,
+                    gather=True,
+                    dim=-1,
+                    nt=1
+                )
                 q = self.q_b_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
                 )
@@ -1732,9 +1893,25 @@ class DeepseekV2AttentionMLA(nn.Module):
                     res1=None,
                     output_unquantized_inp1=False,
                 )
+                mf_save(
+                    self.q_b_proj(q)[0],
+                    name=f"attn-q_b_proj",
+                    layer_id=self.layer_id,
+                    gather=True,
+                    dim=-1,
+                    nt=1
+                )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
+                mf_save(
+                    self.q_b_proj(q)[0],
+                    name=f"attn-q_b_proj",
+                    layer_id=self.layer_id,
+                    gather=True,
+                    dim=-1,
+                    nt=1
+                )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         else:
@@ -1791,6 +1968,26 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q.dtype,
                     forward_batch,
                 )
+        mf_save(
+            kv_a,
+            name=f"attn-norm_kv_c",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            q_pe,
+            name=f"attn-rope_q_pe",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            k_pe,
+            name=f"attn-rope_k_pe",
+            layer_id=self.layer_id,
+            gather=False
+        )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -1802,6 +1999,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+        mf_save(
+            attn_output,
+            name=f"attn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            output,
+            name=f"o_proj",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1851,6 +2062,26 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
+            mf_save(
+                q,
+                name=f"attn-q_c",
+                layer_id=self.layer_id,
+                gather=True,
+                dim=-1,
+                nt=1,
+            )
+            mf_save(
+                latent_cache[..., :self.kv_lora_rank],
+                name=f"attn-kv_c",
+                layer_id=self.layer_id,
+                gather=False
+            )
+            mf_save(
+                latent_cache[..., self.kv_lora_rank:],
+                name=f"attn-kv_pe",
+                layer_id=self.layer_id,
+                gather=False
+            )
 
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
@@ -1892,6 +2123,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)
+            mf_save(
+                k_nope,
+                name=f"attn-norm_kv_c",
+                layer_id=self.layer_id,
+                gather=False,
+            )
+            mf_save(
+                self.q_b_proj(q)[0],
+                name=f"attn-q_b_proj",
+                layer_id=self.layer_id,
+                gather=True,
+                dim=-1,
+                nt=1
+            )
 
             # q_lora needed by indexer
             if self.use_nsa:
@@ -2006,6 +2251,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             # if is_logging_enabled() and self.layer_id == 0:
             #     logger.debug(f"topk_indices: {topk_indices.shape if topk_indices is not None else None}")
+        
+        mf_save(
+            q_pe,
+            name=f"attn-rope_q_pe",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1,
+        )
+        mf_save(
+            k_pe,
+            name=f"attn-rope_k_pe",
+            layer_id=self.layer_id,
+            gather=False,
+        )
 
         return (
             q_pe,
@@ -2421,12 +2681,27 @@ class DeepseekV2AttentionMLA(nn.Module):
             torch.ops.npu.batch_matmul_transpose(
                 attn_output, self.w_vc, attn_bmm_output
             )
+        
+        mf_save(
+            attn_bmm_output,
+            name=f"attn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
 
         attn_bmm_output = attn_bmm_output.reshape(
             -1, self.num_local_heads * self.v_head_dim
         )
 
         output, _ = self.o_proj(attn_bmm_output)
+        mf_save(
+            output,
+            name=f"o_proj",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return output
 
     def forward_absorb_fused_mla_rope_prepare(
@@ -2815,6 +3090,20 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
+        mf_save(
+            attn_output,
+            name=f"attn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            output,
+            name=f"o_proj",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return output
         
     def forward_normal_one_shot_prepare(
@@ -3045,6 +3334,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                layer_id=self.layer_id,
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
@@ -3127,6 +3417,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             quant_format,
         )
+        mf_save(
+            hidden_states,
+            name=f"add_norm",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -3137,6 +3433,12 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        mf_save(
+            hidden_states,
+            name=f"post_add_norm",
+            layer_id=self.layer_id,
+            gather=False
         )
 
         should_allreduce_fusion = (
@@ -3160,6 +3462,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+        mf_save(
+            hidden_states,
+            name=f"mlp",
+            layer_id=self.layer_id,
+            gather=False,
+        )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -3168,6 +3476,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        mf_save(
+            hidden_states,
+            name=f"output",
+            layer_id=self.layer_id,
+            gather=False,
+        )
 
         return hidden_states, residual
 
@@ -3398,6 +3713,12 @@ class DeepseekV2Model(nn.Module):
 
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+        mf_save(
+            hidden_states,
+            name='embedding',
+            layer_id=None,
+            gather=False,
+        )
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
