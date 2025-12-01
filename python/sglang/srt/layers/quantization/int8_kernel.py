@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.mf_tool import is_logging_enabled
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -437,6 +438,14 @@ def w8a8_block_int8_matmul(
                 triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),
         )
 
+    # if is_logging_enabled():
+    #     logger.debug(
+    #         f"w8a8_block_int8_matmul, "
+    #         f"#M_list: {M_list}, "
+    #         f"#A.shape: {list(A.shape)}, "
+    #         f"#B.shape: {list(B.shape)}, "
+    #         f"#C.shape: {list(C.shape)}, "
+    #     )
     for A_p, As_p, B_p, Bs_p, C_p, M_p in \
             zip(A_list, As_list, B_list, Bs_list, C_list, M_list):
         _w8a8_block_int8_matmul[grid](
