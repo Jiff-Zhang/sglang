@@ -599,7 +599,7 @@ class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
         if "cache_quant" in getattr(layer, 'modes', []):
             self.quantize(
                 self.k_buffer[layer_id - self.start_layer],
-                layer.k_tool,
+                layer.k_cache_tool,
                 loc=loc,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
@@ -607,7 +607,7 @@ class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
             )
             self.quantize(
                 self.v_buffer[layer_id - self.start_layer],
-                layer.v_tool,
+                layer.v_cache_tool,
                 loc=loc,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
@@ -1187,7 +1187,7 @@ class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
         if "cache_quant" in getattr(layer, 'modes', []):
             self.quantize(
                 self.kv_buffer[layer_id - self.start_layer],
-                layer.k_tool,
+                layer.k_cache_tool,
                 loc=loc,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
