@@ -45,6 +45,8 @@ class BlockInt8Config(QuantizationConfig):
         weight_block_size: List[int] = None,
         smooth: bool = False,
         mf_format: bool = False,
+        w_sparsity: float = 0.0,
+        w_low_bits: int = 0,
     ) -> None:
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         if is_checkpoint_int8_serialized:
@@ -72,6 +74,8 @@ class BlockInt8Config(QuantizationConfig):
         self.weight_block_size = weight_block_size
         self.smooth = smooth
         self.mf_format = mf_format
+        self.w_sparsity = w_sparsity
+        self.w_low_bits = w_low_bits
 
     @classmethod
     def get_name(cls) -> str:
@@ -98,6 +102,8 @@ class BlockInt8Config(QuantizationConfig):
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         smooth = cls.get_from_keys_or(config, ["smooth"], False)
         mf_format = cls.get_from_keys_or(config, ["mf_format"], False)
+        w_sparsity = cls.get_from_keys_or(config, ["w_sparsity"], 0.0)
+        w_low_bits = cls.get_from_keys_or(config, ["w_low_bits"], 0)
         return cls(
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
@@ -105,6 +111,8 @@ class BlockInt8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             smooth=smooth,
             mf_format=mf_format,
+            w_sparsity=w_sparsity,
+            w_low_bits=w_low_bits,
         )
 
     def get_quant_method(
@@ -219,6 +227,35 @@ class BlockInt8LinearMethod(LinearMethodBase):
         scale[:] = torch.finfo(torch.float32).min
         layer.register_parameter("weight_scale_inv", scale)
 
+        # low bits part
+        if self.quant_config.w_sparsity > 0:
+            # WEIGHT SCALE
+            lscale = BlockQuantScaleParameter(
+                data=torch.empty(
+                    (output_size_per_partition + block_n - 1) // block_n,
+                    (input_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            lscale[:] = torch.finfo(torch.float32).min
+            layer.register_parameter("lweight_scale_inv", lscale)
+            # MASK
+            mask = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("mask", mask)
+        else:
+            layer.lweight_scale_inv = None
+            layer.mask = 1
+
         # INPUT ACTIVATION SCALE
         assert self.quant_config.activation_scheme == "dynamic"
         layer.register_parameter("input_scale", None)
@@ -253,10 +290,10 @@ class BlockInt8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if self.quant_config.smooth:
             x = x / layer.smooth_scale
-        
-        return apply_w8a8_block_int8_linear(
+            
+        output = apply_w8a8_block_int8_linear(
             input=x,
-            weight=layer.weight,
+            weight=layer.weight * layer.mask,
             block_size=self.quant_config.weight_block_size,
             weight_scale=layer.weight_scale_inv,
             input_scale=None,
@@ -264,6 +301,17 @@ class BlockInt8LinearMethod(LinearMethodBase):
             mf_format=self.quant_config.mf_format
         )
 
+        if self.quant_config.w_sparsity > 0:
+            output += apply_w8a8_block_int8_linear(
+                input=x,
+                weight=layer.weight * (1 - layer.mask),
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=layer.lweight_scale_inv,
+                input_scale=None,
+                bias=bias,
+                mf_format=self.quant_config.mf_format
+            )
+        return output
 
 class BlockInt8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
@@ -342,6 +390,36 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        
+        # low bits part
+        if self.quant_config.w_sparsity > 0:
+            # MASK
+            w13_mask = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_mask", w13_mask)
+            set_weight_attrs(w13_mask, extra_weight_attrs)
+
+            w2_mask = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_mask", w2_mask)
+            set_weight_attrs(w2_mask, extra_weight_attrs)
+        else:
+            layer.w13_mask = 1
+            layer.w2_mask = 1
 
         # WEIGHT_SCALES
         w13_weight_scale = torch.nn.Parameter(
@@ -370,6 +448,35 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         )
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # low bits part
+        if self.quant_config.w_sparsity > 0:
+            # WEIGHT_SCALES
+            w13_lweight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_lweight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_lweight_scale_inv", w13_lweight_scale)
+            layer.register_parameter("w2_lweight_scale_inv", w2_lweight_scale)
+            set_weight_attrs(w13_lweight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_lweight_scale, extra_weight_attrs)
+        else:
+            layer.w13_lweight_scale_inv = None
+            layer.w2_lweight_scale_inv = None
 
         # INPUT_SCALES
         assert self.quant_config.activation_scheme == "dynamic"
@@ -423,8 +530,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
 
         quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
+            w13_weight=layer.w13_weight * layer.w13_mask,
+            w2_weight=layer.w2_weight * layer.w2_mask,
             use_int8_w8a8=True,
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
@@ -435,4 +542,25 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             block_shape=self.quant_config.weight_block_size,
         )
 
-        return self.runner.run(dispatch_output, quant_info)
+        output = self.runner.run(dispatch_output, quant_info)
+        
+        if self.quant_config.w_sparsity > 0:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight * (1 - layer.w13_mask),
+                w2_weight=layer.w2_weight * (1 - layer.w2_mask),
+                use_int8_w8a8=True,
+                w13_scale=layer.w13_lweight_scale_inv,
+                w2_scale=layer.w2_lweight_scale_inv,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                a13_smooth_scale=layer.w13_smooth_scale,
+                a2_smooth_scale=layer.w2_smooth_scale,
+                block_shape=self.quant_config.weight_block_size,
+            )
+
+            loutput = self.runner.run(dispatch_output, quant_info)
+            output = output.__class__(
+                hidden_states=output.hidden_states + loutput.hidden_states
+            )
+            
+        return output
