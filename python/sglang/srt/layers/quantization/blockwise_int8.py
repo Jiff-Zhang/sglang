@@ -48,7 +48,6 @@ class BlockInt8Config(QuantizationConfig):
         smooth: bool = False,
         mf_format: bool = False,
         w_sparsity: float = 0.0,
-        w_low_bits: int = 0,
         mask_in_id: bool = False
     ) -> None:
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
@@ -78,7 +77,6 @@ class BlockInt8Config(QuantizationConfig):
         self.smooth = smooth
         self.mf_format = mf_format
         self.w_sparsity = w_sparsity
-        self.w_low_bits = w_low_bits
         self.mask_in_id = mask_in_id
 
     @classmethod
@@ -107,7 +105,6 @@ class BlockInt8Config(QuantizationConfig):
         smooth = cls.get_from_keys_or(config, ["smooth"], False)
         mf_format = cls.get_from_keys_or(config, ["mf_format"], False)
         w_sparsity = cls.get_from_keys_or(config, ["w_sparsity"], 0.0)
-        w_low_bits = cls.get_from_keys_or(config, ["w_low_bits"], 0)
         mask_in_id = cls.get_from_keys_or(config, ["mask_in_id"], False)
         return cls(
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
@@ -117,7 +114,6 @@ class BlockInt8Config(QuantizationConfig):
             smooth=smooth,
             mf_format=mf_format,
             w_sparsity=w_sparsity,
-            w_low_bits=w_low_bits,
             mask_in_id=mask_in_id
         )
 
@@ -498,8 +494,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 layer.register_parameter("w2_mask", w2_mask)
                 set_weight_attrs(w2_mask, extra_weight_attrs)
         else:
-            layer.w13_mask = 1
-            layer.w2_mask = 1
+            layer.w13_mask = None
+            layer.w2_mask = None
 
         # WEIGHT_SCALES
         w13_weight_scale = torch.nn.Parameter(
@@ -631,37 +627,22 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_mask = layer.w2_mask
         
         quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight * w13_mask,
-            w2_weight=layer.w2_weight * w2_mask,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             use_int8_w8a8=True,
+            w13_mask=w13_mask, # moffett
+            w2_mask=w2_mask, # moffett
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
+            w13_lscale=layer.w13_lweight_scale_inv, # moffett
+            w2_lscale=layer.w2_lweight_scale_inv, # moffett
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            a13_smooth_scale=layer.w13_smooth_scale,
-            a2_smooth_scale=layer.w2_smooth_scale,
+            a13_smooth_scale=layer.w13_smooth_scale, # moffett: unimplemented
+            a2_smooth_scale=layer.w2_smooth_scale, # moffett: unimplemented
             block_shape=self.quant_config.weight_block_size,
         )
 
         output = self.runner.run(dispatch_output, quant_info)
         
-        if self.quant_config.w_sparsity > 0:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight * (1 - w13_mask),
-                w2_weight=layer.w2_weight * (1 - w2_mask),
-                use_int8_w8a8=True,
-                w13_scale=layer.w13_lweight_scale_inv,
-                w2_scale=layer.w2_lweight_scale_inv,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                a13_smooth_scale=layer.w13_smooth_scale,
-                a2_smooth_scale=layer.w2_smooth_scale,
-                block_shape=self.quant_config.weight_block_size,
-            )
-
-            loutput = self.runner.run(dispatch_output, quant_info)
-            output = output.__class__(
-                hidden_states=output.hidden_states + loutput.hidden_states
-            )
-            
         return output
