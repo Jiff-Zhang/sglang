@@ -2,6 +2,8 @@ import os
 import math
 import torch
 import logging
+from einops import rearrange
+from typing import Optional, Tuple, List, Mapping, Dict, Callable
 
 from sparseopt.attns.act_sparse_nbits import MFSparseNbits
 from sparseopt.attns.retriever import TokenSparseRetriever
@@ -24,7 +26,7 @@ def quantize(
 ):
     if x.numel() == 0:
         return x
-    
+
     seq_len = x.size(0)
     if tool.is_seq_rely and tool.bank_size > 0:
         quant_len = math.floor(seq_len / tool.bank_size) * tool.bank_size
@@ -43,7 +45,7 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
 
     assert isinstance(layer, RadixAttention), f"layer must be an instance of RadixAttention, got {type(layer)}"
     assert num_kv_heads > 0, f"num_kv_heads must be > 0, got {num_kv_heads}"
-    
+
     # return
     bank_size = 64
     modes = [
@@ -83,7 +85,7 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
     v_tool = per_group_tool
     k_cache_tool = per_bank_tool
     v_cache_tool = per_group_tool
-    
+
     retriever = TokenSparseRetriever(
         active=True,
         # retain_size=2048,
@@ -144,7 +146,6 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
             f"\t#v_cache_tool: {v_cache_tool.stats_str}"
         )
 
-
 saved_names = defaultdict(list)
 def save(
     x: torch.Tensor, # [S, ..., D]
@@ -157,7 +158,7 @@ def save(
     return
     # if layer_id is not None and layer_id > 3:
     #     return
-    
+
     ori_shape = x.shape
 
     if gather:
@@ -171,10 +172,10 @@ def save(
             x = rearrange(x, "... nt d -> ... (nt d)")
         if dim != -1 or dim != x.dim() - 1:
             x = x.transpose(dim, -1)
-        
+
     if get_attention_tp_rank() != 0:
         return
-    
+
     logger.debug(f"ori_shape: {list(ori_shape)}, x.shape: {list(x.shape)}")
 
     out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-R1"
@@ -183,7 +184,7 @@ def save(
     if layer_id is not None:
         out_dir = os.path.join(out_dir, f"layer{layer_id:02d}")
     os.makedirs(out_dir, exist_ok=True)
-    
+
     # prefix = "prefill" if x.size(0) > 1 else "decode"
     if name in saved_names[layer_id]:
         prefix = "decode"
@@ -194,3 +195,23 @@ def save(
     out_file = os.path.join(out_dir, pth_name)
     logging.debug(f"Saving tensor with shape {x.shape} to {out_file}...")
     torch.save(x, out_file)
+
+def generate_mask(
+    mask_id: torch.Tensor, # [O, I, N]
+    block_size: Tuple[int, int], # [BO, BI]
+    dtype: torch.dtype,
+):
+    assert mask_id.dim() == 3, \
+        f"Only support 3D mask_id, but got {mask_id.dim()}"
+    assert len(block_size) == 2, \
+        f"Only support 2D block_size, but got {block_size}"
+    mask = torch.zeros(
+        (*mask_id.shape[:-1], block_size[0] * block_size[1]),
+        dtype=dtype,
+        device=mask_id.device
+    )
+    mask.scatter_(dim=-1, index=mask_id.to(torch.int32), value=1)
+    mask = rearrange(
+        mask, "O I (BI BO) -> (O BO) (I BI)", BO=block_size[0], BI=block_size[1]
+    )
+    return mask

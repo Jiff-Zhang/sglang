@@ -7,11 +7,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
+from einops import rearrange
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.parameter import BlockQuantScaleParameter, RowvLLMParameter, ModelWeightParameter
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, RowvLLMParameter, _ColumnvLLMParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -22,6 +23,7 @@ from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_line
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.mf_tool import generate_mask
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -47,6 +49,7 @@ class BlockInt8Config(QuantizationConfig):
         mf_format: bool = False,
         w_sparsity: float = 0.0,
         w_low_bits: int = 0,
+        mask_in_id: bool = False
     ) -> None:
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         if is_checkpoint_int8_serialized:
@@ -76,6 +79,7 @@ class BlockInt8Config(QuantizationConfig):
         self.mf_format = mf_format
         self.w_sparsity = w_sparsity
         self.w_low_bits = w_low_bits
+        self.mask_in_id = mask_in_id
 
     @classmethod
     def get_name(cls) -> str:
@@ -104,6 +108,7 @@ class BlockInt8Config(QuantizationConfig):
         mf_format = cls.get_from_keys_or(config, ["mf_format"], False)
         w_sparsity = cls.get_from_keys_or(config, ["w_sparsity"], 0.0)
         w_low_bits = cls.get_from_keys_or(config, ["w_low_bits"], 0)
+        mask_in_id = cls.get_from_keys_or(config, ["mask_in_id"], False)
         return cls(
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
@@ -113,6 +118,7 @@ class BlockInt8Config(QuantizationConfig):
             mf_format=mf_format,
             w_sparsity=w_sparsity,
             w_low_bits=w_low_bits,
+            mask_in_id=mask_in_id
         )
 
     def get_quant_method(
@@ -243,15 +249,46 @@ class BlockInt8LinearMethod(LinearMethodBase):
             lscale[:] = torch.finfo(torch.float32).min
             layer.register_parameter("lweight_scale_inv", lscale)
             # MASK
-            mask = ModelWeightParameter(
-                data=torch.empty(
-                    output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            )
-            layer.register_parameter("mask", mask)
+            if self.quant_config.mask_in_id:
+                # mask_id = _ColumnvLLMParameter(
+                #     data=torch.empty(
+                #         output_size_per_partition,
+                #         (input_size_per_partition + block_k - 1) // block_k,
+                #         int(
+                #             self.quant_config.weight_block_size[1] * \
+                #                 (1 - self.quant_config.w_sparsity)
+                #         ),
+                #         dtype=torch.int8
+                #     ),
+                #     output_dim=0,
+                #     weight_loader=weight_loader
+                # )
+                mask_id = BlockQuantScaleParameter(
+                    data=torch.empty(
+                        (output_size_per_partition + block_n - 1) // block_n,
+                        (input_size_per_partition + block_k - 1) // block_k,
+                        int(
+                            self.quant_config.weight_block_size[1] * \
+                                self.quant_config.weight_block_size[0] * \
+                                (1 - self.quant_config.w_sparsity)
+                        ),
+                        dtype=torch.int8
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader
+                )
+                layer.register_parameter("mask_id", mask_id)
+            else:
+                mask = ModelWeightParameter(
+                    data=torch.empty(
+                        output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("mask", mask)
         else:
             layer.lweight_scale_inv = None
             layer.mask = 1
@@ -290,10 +327,19 @@ class BlockInt8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if self.quant_config.smooth:
             x = x / layer.smooth_scale
-            
+
+        if self.quant_config.w_sparsity > 0 and self.quant_config.mask_in_id:
+            mask = generate_mask(
+                layer.mask_id,
+                self.quant_config.weight_block_size,
+                dtype=layer.weight.dtype,
+            )
+        else:
+            mask = layer.mask
+        
         output = apply_w8a8_block_int8_linear(
             input=x,
-            weight=layer.weight * layer.mask,
+            weight=layer.weight * mask,
             block_size=self.quant_config.weight_block_size,
             weight_scale=layer.weight_scale_inv,
             input_scale=None,
@@ -304,7 +350,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         if self.quant_config.w_sparsity > 0:
             output += apply_w8a8_block_int8_linear(
                 input=x,
-                weight=layer.weight * (1 - layer.mask),
+                weight=layer.weight * (1 - mask),
                 block_size=self.quant_config.weight_block_size,
                 weight_scale=layer.lweight_scale_inv,
                 input_scale=None,
@@ -394,29 +440,63 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         # low bits part
         if self.quant_config.w_sparsity > 0:
             # MASK
-            w13_mask = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    2 * intermediate_size_per_partition,
-                    hidden_size,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w13_mask", w13_mask)
-            set_weight_attrs(w13_mask, extra_weight_attrs)
+            if self.quant_config.mask_in_id:
+                w13_mask_id = torch.nn.Parameter(
+                    torch.empty(
+                        num_experts,
+                        2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                        (hidden_size + block_k - 1) // block_k,
+                        int(
+                            self.quant_config.weight_block_size[1] * \
+                                self.quant_config.weight_block_size[0] * \
+                                (1 - self.quant_config.w_sparsity)
+                        ),
+                        dtype=torch.int8,
+                    ),
+                    requires_grad=False
+                )
+                layer.register_parameter("w13_mask_id", w13_mask_id)
+                set_weight_attrs(w13_mask_id, extra_weight_attrs)
+                w2_mask_id = torch.nn.Parameter(
+                    torch.empty(
+                        num_experts,
+                        (hidden_size + block_n - 1) // block_n,
+                        (intermediate_size_per_partition + block_k - 1) // block_k,
+                        int(
+                            self.quant_config.weight_block_size[1] * \
+                                self.quant_config.weight_block_size[0] * \
+                                (1 - self.quant_config.w_sparsity)
+                        ),
+                        dtype=torch.int8,
+                    ),
+                    requires_grad=False
+                )
+                layer.register_parameter("w2_mask_id", w2_mask_id)
+                set_weight_attrs(w2_mask_id, extra_weight_attrs)
+            else:
+                w13_mask = torch.nn.Parameter(
+                    torch.empty(
+                        num_experts,
+                        2 * intermediate_size_per_partition,
+                        hidden_size,
+                        dtype=params_dtype,
+                    ),
+                    requires_grad=False,
+                )
+                layer.register_parameter("w13_mask", w13_mask)
+                set_weight_attrs(w13_mask, extra_weight_attrs)
 
-            w2_mask = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    hidden_size,
-                    intermediate_size_per_partition,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w2_mask", w2_mask)
-            set_weight_attrs(w2_mask, extra_weight_attrs)
+                w2_mask = torch.nn.Parameter(
+                    torch.empty(
+                        num_experts,
+                        hidden_size,
+                        intermediate_size_per_partition,
+                        dtype=params_dtype,
+                    ),
+                    requires_grad=False,
+                )
+                layer.register_parameter("w2_mask", w2_mask)
+                set_weight_attrs(w2_mask, extra_weight_attrs)
         else:
             layer.w13_mask = 1
             layer.w2_mask = 1
@@ -529,9 +609,30 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
+        if self.quant_config.w_sparsity > 0 and self.quant_config.mask_in_id:
+            w13_mask = generate_mask(
+                rearrange(layer.w13_mask_id, "E O I N -> (E O) I N"),
+                self.quant_config.weight_block_size,
+                dtype=layer.w13_weight.dtype,
+            )
+            w13_mask = rearrange(
+                w13_mask, "(E O) I -> E O I", E=layer.w13_weight.size(0)
+            )
+            w2_mask = generate_mask(
+                rearrange(layer.w2_mask_id, "E O I N -> (E O) I N"),
+                self.quant_config.weight_block_size,
+                dtype=layer.w2_weight.dtype,
+            )
+            w2_mask = rearrange(
+                w2_mask, "(E O) I -> E O I", E=layer.w2_weight.size(0)
+            )
+        else:
+            w13_mask = layer.w13_mask
+            w2_mask = layer.w2_mask
+        
         quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight * layer.w13_mask,
-            w2_weight=layer.w2_weight * layer.w2_mask,
+            w13_weight=layer.w13_weight * w13_mask,
+            w2_weight=layer.w2_weight * w2_mask,
             use_int8_w8a8=True,
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
@@ -546,8 +647,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         
         if self.quant_config.w_sparsity > 0:
             quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight * (1 - layer.w13_mask),
-                w2_weight=layer.w2_weight * (1 - layer.w2_mask),
+                w13_weight=layer.w13_weight * (1 - w13_mask),
+                w2_weight=layer.w2_weight * (1 - w2_mask),
                 use_int8_w8a8=True,
                 w13_scale=layer.w13_lweight_scale_inv,
                 w2_scale=layer.w2_lweight_scale_inv,
