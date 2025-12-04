@@ -1,9 +1,11 @@
 import safetensors
+from safetensors.torch import save_file
 import torch
 from torch import nn
 from torch.nn import functional as F
 import json
 import os
+import math
 import glob
 
 from collections import defaultdict
@@ -25,6 +27,7 @@ from functools import partial, reduce
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from multiprocessing import Pool, cpu_count
+import shutil
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -179,7 +182,7 @@ def register_compress_tool(
             )
     return hooks, tools
 
-def solve_weight(name, tool: CompressOPT, smooth=True):
+def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
     if "experts." not in name and smooth:
         tool.smooth()
     
@@ -231,12 +234,12 @@ def solve_weight(name, tool: CompressOPT, smooth=True):
     else:
         lweight, lscale = 0, 0
 
-    weight = hweight * mask + lweight * (1 - mask)
+    weight = (hweight * mask + lweight * (1 - mask)).to(torch.int8)
     module.weight = nn.Parameter(
-        weight.to(module.weight.device), requires_grad=False
+        weight.to(module.weight.device, torch.int8), requires_grad=False
     )
     module.weight_scale_inv = nn.Parameter(
-        hscale.to(module.weight_scale_inv.device)
+        hscale.to(module.weight_scale_inv.device, torch.bfloat16)
     )
     if config.sparsity > 0:
         # module.register_parameter(
@@ -246,14 +249,34 @@ def solve_weight(name, tool: CompressOPT, smooth=True):
         # )
         module.register_parameter(
             "lweight_scale_inv", nn.Parameter(
-                lscale.to(module.weight_scale_inv.device)
+                lscale.to(module.weight_scale_inv.device, torch.bfloat16)
             )
         )
-        module.register_parameter(
-            "mask", nn.Parameter(
-                mask.to(module.weight.device, torch.int8), requires_grad=False
+        if mask_in_id:
+            # [O, NB, BankSize]
+            mask = mf_tool.sparse_tool.transform.preprocess(mask)
+            idx, idy, idz = torch.where(mask == 1)
+            mask_id = idz.view(mask.size(0), mask.size(1), -1)
+            module.register_parameter(
+                "mask_id", nn.Parameter(
+                    mask_id.to(module.weight.device, torch.int8), requires_grad=False
+                )
             )
-        )
+            mask_n = torch.zeros(
+                (mask_id.size(0), mask_id.size(1), mf_tool.sparse_tool.bank_size),
+                dtype=torch.int8
+            )
+            mask_n.scatter_(2, mask_id, 1)
+            mask_n = mf_tool.sparse_tool.transform.postprocess(mask_n)
+            mask = mf_tool.sparse_tool.transform.postprocess(mask)
+            assert (mask == mask_n).all()
+            module.mask = mask
+        else:
+            module.register_parameter(
+                "mask", nn.Parameter(
+                    mask.to(module.weight.device, torch.int8), requires_grad=False
+                )
+            )
     else:
         # module.lweight = torch.tensor(0, dtype=torch.int8)
         module.lweight_scale_inv = torch.tensor(0, dtype=torch.bfloat16)
@@ -307,36 +330,131 @@ def reset_past_key_values(past_key_values: DynamicCache, layer_idx: int):
     past_key_values.layers[layer_idx].keys = None
     past_key_values.layers[layer_idx].is_initialized = False
 
-def run(model, args_cache, kwargs_cache, num_samples, device, compress_config, smooth=True):
+
+class ModelSaver:
+    def __init__(self, model: DeepseekV3ForCausalLM, out_dir: str):
+        self.model = model
+        num_layers = len(model.model.layers)
+        self.moe_layers = [
+            i for i in range(
+                model.config.first_k_dense_replace,
+                num_layers,
+                model.config.moe_layer_freq
+            )
+        ]
+        self.normal_layers = [i for i in range(num_layers)]
+        self.normal_layers = list(filter(
+            lambda i: i not in self.moe_layers, self.normal_layers
+        ))
+        self.moe_split = 6
+        self.total = (
+            # embedding + lm_head
+            1 +
+            # normal layers
+            len(self.normal_layers) +
+            # moe layers
+            self.moe_split * len(self.moe_layers)
+        )
+        self.num_saved = 0
+        self.param_refs = {
+            "metadata": {
+                "total_size": 0
+            },
+            "weight_map": {}
+        }
+        self.out_dir = out_dir
+
+    def save(self, params, layer_idx: int=None):
+        os.makedirs(self.out_dir, exist_ok=True)
+        if layer_idx is None or layer_idx in self.normal_layers:
+            self.num_saved += 1
+            filename = f"model-{self.num_saved:06d}-of-{self.total:06d}.safetensors"
+            print(f"Saving param to {filename} ...")
+            save_file(params, os.path.join(self.out_dir, filename))
+            self.param_refs["weight_map"].update({name: filename for name in params.keys()})
+            # self.param_refs["metadata"]["total_size"] += os.path.getsize(
+            #     os.path.join(self.out_dir, filename)
+            # )
+            self.param_refs["metadata"]["total_size"] += sum(
+                [v.numel() for v in params.values()]
+            )
+        else:
+            num_to_split = math.ceil(len(params) / self.moe_split)
+            for i in range(self.moe_split):
+                param_to_save = {
+                    k: params[k]
+                    for k in list(params.keys())[i*num_to_split:(i+1)*num_to_split]
+                }
+                self.save(param_to_save, layer_idx=None)
+
+    def finish(self):
+        with open(
+            os.path.join(
+                self.out_dir, "model.safetensors.index.json"
+            ),
+            mode="w"
+        ) as fid:
+            json.dump(self.param_refs, fid, indent=4, ensure_ascii=True)
+        self.model.config.save_pretrained(self.out_dir)
+        # with open(
+        #     os.path.join(self.out_dir, "config.json"), mode="w"
+        # ) as fid:
+        #     json.dump(
+        #         self.model.config.to_dict(), fid, indent=4, ensure_ascii=True
+        #     )
+
+def run(
+    model: DeepseekV3ForCausalLM,
+    args_cache,
+    kwargs_cache,
+    device,
+    compress_config,
+    out_dir,
+    smooth=True,
+    partial_save=False,
+    mask_in_id=False
+):
+    if partial_save:
+        assert out_dir is not None
+        saver = ModelSaver(model, out_dir=out_dir)
+        layers = model.model.layers
+        model.model.layers = nn.ModuleList([])
+        saver.save(model.state_dict(), layer_idx=None)
+        model.model.layers = layers
+    else:
+        saver = None
+    
     with torch.no_grad():
         for layer_idx, layer in enumerate(model.model.layers):
             hooks, tools = register_compress_tool(
                 layer, compress_config=compress_config
             )
             
-            layer = layer.to(device)
-            # layer._forward_pre_hooks_with_kwargs = OrderedDict()
-            device_hook = layer.register_forward_pre_hook(
-                partial(cuda_hook, device=device), with_kwargs=True
-            )
+            if smooth:
+                layer = layer.to(device)
+                # layer._forward_pre_hooks_with_kwargs = OrderedDict()
+                device_hook = layer.register_forward_pre_hook(
+                    partial(cuda_hook, device=device), with_kwargs=True
+                )
             
-            for i in tqdm(
-                range(len(args_cache[:num_samples])),
-                desc=f"Running layer {layer_idx:2d}"
-            ):
-                reset_past_key_values(kwargs_cache[i]['past_key_values'], layer_idx)
-                
-                args_cache[i][0] = layer(*args_cache[i], **kwargs_cache[i]).detach().to('cpu')
-                reset_past_key_values(kwargs_cache[i]['past_key_values'], layer_idx)
-            device_hook.remove()
-            layer = layer.to('cpu')
+                for i in tqdm(
+                    range(len(args_cache)),
+                    desc=f"Running layer {layer_idx:2d}"
+                ):
+                    reset_past_key_values(kwargs_cache[i]['past_key_values'], layer_idx)
+
+                    args_cache[i][0] = layer(*args_cache[i], **kwargs_cache[i]).detach().to('cpu')
+                    
+                    reset_past_key_values(kwargs_cache[i]['past_key_values'], layer_idx)
+                device_hook.remove()
+                layer = layer.to('cpu')
             
             for hook in hooks.values():
                 hook.remove()
 
             for name, tool in tqdm(tools.items(), desc=f"Solving layer {layer_idx:2d}"):
                 tqdm.write(f"### Compressing: {name} ###")
-                solve_weight(name, tool, smooth=smooth)
+                solve_weight(name, tool, smooth=smooth, mask_in_id=mask_in_id)
             # with ProcessPoolExecutor(max_workers=cpu_count()//2) as executor:
             #     futures = list()
             #     for name, tool in tools.items():
@@ -344,6 +462,31 @@ def run(model, args_cache, kwargs_cache, num_samples, device, compress_config, s
             #     # for future in tqdm(as_completed(futures), desc=f"Solving layer {layer_idx:2d}"):
             #     for future in tqdm(futures, desc=f"Solving layer {layer_idx:2d}"):
             #         future.result()
+            if partial_save:
+                saver.save(
+                    layer.state_dict(prefix=f"model.layers.{layer_idx}."), 
+                    layer_idx=layer_idx
+                )
+                model.model.layers[layer_idx] = nn.Module()
+
+    model.config.quantization_config = {
+        "activation_scheme": "dynamic",
+        "mf_format": True,
+        "quant_method": "blockwise_int8",
+        "smooth": smooth,
+        "w_sparsity": sparsity,
+        "w_low_bits": low_bits,
+        "mask_in_id": mask_in_id and sparsity > 0,
+        "weight_block_size": [
+            1,
+            64
+        ]
+    }
+    model.config.num_hidden_layers = len(model.model.layers)
+    if partial_save:
+        saver.finish()
+    else:
+        model.save_pretrained(out_dir, max_shard_size="4GB")
 
 if __name__ == "__main__":
     device = torch.device('cuda:0')
@@ -356,12 +499,16 @@ if __name__ == "__main__":
         torch_dtype="auto",
         device_map="cpu"
     )
+    # tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     
     num_layers = 4
-    num_samples = 1
-    # num_layers = len(model.model.layers)
-    # num_samples = len(args_cache)
+    # num_samples = 1
+    num_layers = len(model.model.layers)
+    num_samples = len(args_cache)
+    
     model.model.layers = model.model.layers[:num_layers]
+    args_cache = args_cache[:num_samples]
+    kwargs_cache = kwargs_cache[:num_samples]
 
     smooth = True
     smooth = False
@@ -370,31 +517,48 @@ if __name__ == "__main__":
     sparsity = 0.875
     high_bits = 8
     low_bits = 3
+    low_bits = 8
     compress_config = get_compress_config(sparsity, high_bits, low_bits)
+
+    # partial_save = False
+    partial_save = True
+
+    mask_in_id = False
+    mask_in_id = True
     
+    out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus-model"
+    # out_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Int8-smooth"
+    out_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-W8xH8L3"
     run(
         model,
         args_cache,
         kwargs_cache,
-        num_samples,
         device,
         compress_config=compress_config,
-        smooth=smooth
+        out_dir=out_dir,
+        smooth=smooth,
+        partial_save=partial_save,
+        mask_in_id=mask_in_id
     )
-
-    model.config.quantization_config = {
-        "activation_scheme": "dynamic",
-        "mf_format": True,
-        "quant_method": "blockwise_int8",
-        "smooth": smooth,
-        "w_sparisty": sparsity,
-        "w_low_bits": low_bits,
-        "weight_block_size": [
-            1,
-            64
-        ]
-    }
-    model.config.num_hidden_layers = num_layers
-    out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus-model"
-    # out_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Int8-smooth"
-    model.save_pretrained(out_dir, max_shard_size="4GB")
+    # tokenizer.save_pretrained(out_dir)
+    file_list = [
+        "configuration.json",
+        "configuration_deepseek.py",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "modeling_deepseek.py",
+        "inference"
+    ]
+    for filepath in file_list:
+        if os.path.isdir(os.path.join(model_name_or_path, filepath)):
+            shutil.copytree(
+                os.path.join(model_name_or_path, filepath),
+                os.path.join(out_dir, filepath),
+                dirs_exist_ok=True
+            )
+        else:
+            shutil.copy(
+                os.path.join(model_name_or_path, filepath),
+                os.path.join(out_dir, filepath)
+            )
