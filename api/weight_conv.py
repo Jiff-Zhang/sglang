@@ -475,7 +475,7 @@ def run(
         "quant_method": "blockwise_int8",
         "smooth": smooth,
         "w_sparsity": sparsity,
-        "w_low_bits": low_bits,
+        # "w_low_bits": low_bits,
         "mask_in_id": mask_in_id and sparsity > 0,
         "weight_block_size": [
             1,
@@ -517,7 +517,7 @@ if __name__ == "__main__":
     sparsity = 0.875
     high_bits = 8
     low_bits = 3
-    low_bits = 8
+    # low_bits = 8
     compress_config = get_compress_config(sparsity, high_bits, low_bits)
 
     # partial_save = False

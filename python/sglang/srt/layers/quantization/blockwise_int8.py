@@ -203,6 +203,11 @@ class BlockInt8LinearMethod(LinearMethodBase):
             if self.quant_config.is_checkpoint_int8_serialized
             else params_dtype
         )
+        scale_dtype = (
+            torch.bfloat16
+            if self.quant_config.mf_format
+            else torch.float32
+        )
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -215,18 +220,17 @@ class BlockInt8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE
-
         scale = BlockQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition + block_n - 1) // block_n,
                 (input_size_per_partition + block_k - 1) // block_k,
-                dtype=torch.float32,
+                dtype=scale_dtype,
             ),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
         )
-        scale[:] = torch.finfo(torch.float32).min
+        scale[:] = torch.finfo(scale_dtype).min
         layer.register_parameter("weight_scale_inv", scale)
 
         # low bits part
@@ -236,13 +240,13 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 data=torch.empty(
                     (output_size_per_partition + block_n - 1) // block_n,
                     (input_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
-            lscale[:] = torch.finfo(torch.float32).min
+            lscale[:] = torch.finfo(scale_dtype).min
             layer.register_parameter("lweight_scale_inv", lscale)
             # MASK
             if self.quant_config.mask_in_id:
@@ -385,6 +389,11 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_int8_serialized:
             params_dtype = torch.int8
+        scale_dtype = (
+            torch.bfloat16
+            if self.quant_config.mf_format
+            else torch.float32
+        )
         tp_size = get_tensor_model_parallel_world_size()
 
         block_n, block_k = (
@@ -503,7 +512,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
-                dtype=torch.float32,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -512,7 +521,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 (hidden_size + block_n - 1) // block_n,
                 (intermediate_size_per_partition + block_k - 1) // block_k,
-                dtype=torch.float32,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -533,7 +542,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
@@ -542,7 +551,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
@@ -568,7 +577,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     1,
                     hidden_size,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
@@ -577,7 +586,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     1,
                     intermediate_size_per_partition,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
@@ -607,12 +616,15 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.w_sparsity > 0 and self.quant_config.mask_in_id:
             w13_mask = generate_mask(
-                rearrange(layer.w13_mask_id, "E O I N -> (E O) I N"),
+                rearrange(layer.w13_mask_id, "E O (G I) N -> (E G O) I N", G=2),
                 self.quant_config.weight_block_size,
                 dtype=layer.w13_weight.dtype,
             )
             w13_mask = rearrange(
-                w13_mask, "(E O) I -> E O I", E=layer.w13_weight.size(0)
+                w13_mask,
+                "(E G O) I -> E O (G I)",
+                E=layer.w13_weight.size(0),
+                G=2
             )
             w2_mask = generate_mask(
                 rearrange(layer.w2_mask_id, "E O I N -> (E O) I N"),
@@ -636,6 +648,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale_inv,
             w13_lscale=layer.w13_lweight_scale_inv, # moffett
             w2_lscale=layer.w2_lweight_scale_inv, # moffett
+            mf_format=self.quant_config.mf_format, # moffett
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             a13_smooth_scale=layer.w13_smooth_scale, # moffett: unimplemented

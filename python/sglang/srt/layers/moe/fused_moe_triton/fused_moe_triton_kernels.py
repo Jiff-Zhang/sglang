@@ -606,6 +606,7 @@ def invoke_fused_moe_kernel(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
+    mf_format: bool = False,
     no_combine: bool = False,
     a_use_tma: bool = False,
     b_use_tma: bool = False,
@@ -648,10 +649,23 @@ def invoke_fused_moe_kernel(
             # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            if mf_format:
+                from sparseopt.attns.act_sparse_nbits import QuantTool
+                tool = QuantTool(
+                    mode="per_bank",
+                    dtype="int8",
+                    bank_size=block_k,
+                    symmetric=True
+                )
+                A = tool.transform.preprocess(A)
+                A, A_scale = tool.sym_quant(A)
+                A = tool.transform.postprocess(A).to(torch.int8)
+                A_scale = tool.transform.postprocess(A_scale)
             else:
-                A, A_scale = per_token_group_quant_int8(A, block_k)
+                if _is_cuda:
+                    A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_int8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
