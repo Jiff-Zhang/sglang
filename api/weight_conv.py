@@ -156,26 +156,31 @@ def register_compress_tool(
                 if any([item in name for item in pair_item]):
                     pair = pair_item
             if len(pair) == 0:
-                tools[name] = get_compress_tool(
-                    [module], compress_config=compress_config
-                )
+                modules = [module]
+                module_names = [name]
             else:
                 match_key = list(filter(lambda x: x in name, pair))[0]
-                index = pair.index(match_key)
+                module_names = [name.replace(match_key, item) for item in pair]
                 modules = [
-                    layer.get_submodule(name.replace(match_key, item))
-                    for item in pair
+                    layer.get_submodule(module_name)
+                    for module_name in module_names
                 ]
+                # print(index, match_key, pair, tools[name].weight_slice)
+
+            if name not in tools:
                 tools[name] = get_compress_tool(
                     modules, compress_config=compress_config
                 )
-                wo_list = [module.weight.size(0) for module in modules]
+                wo_list = [0] + [module.weight.size(0) for module in modules]
                 setattr(
-                    tools[name], "weight_slice",
-                    (sum(wo_list[:index]), sum(wo_list[:index+1]))
+                    tools[name], "weight_slices",
+                    torch.cumsum(torch.tensor(wo_list), dim=0)
                 )
-                # print(index, match_key, pair, tools[name].weight_slice)
-            setattr(tools[name], "ori_module", module)
+                setattr(tools[name], "ori_modules", modules)
+                setattr(tools[name], "ori_module_names", module_names)
+                for module_name in module_names:
+                    tools[module_name] = tools[name]
+            
             hooks[name] = module.register_forward_pre_hook(
                 partial(add_batch, tool=tools[name]),
                 with_kwargs=True
@@ -184,12 +189,16 @@ def register_compress_tool(
 
 def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
     if "experts." not in name and smooth:
-        tool.smooth()
+        if not getattr(tool, "already_smooth", False):
+            tool.smooth()
+            setattr(tool, "already_smooth", True)
+        else:
+            print("already smooth !!!")
     
     weight = tool.module.weight
-    if hasattr(tool, "weight_slice"):
-        weight_slice = getattr(tool, "weight_slice")
-        weight = weight[weight_slice[0]: weight_slice[1]]
+    module_id = getattr(tool, "ori_module_names").index(name)
+    weight_slices = getattr(tool, "weight_slices")
+    weight = weight[weight_slices[module_id]: weight_slices[module_id + 1]]
 
     config = tool.compress_cfg.weights
     dtypes = {
@@ -206,10 +215,11 @@ def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
         quant_masked=True
     )
 
-    module = tool.ori_module
+    module = tool.ori_modules[module_id]
     ori_weight = get_weight(module)
     
-    assert module.weight.size() == weight.size()
+    assert module.weight.size() == weight.size(), \
+        f"{module.weight.size()} != {weight.size()}"
     if not isinstance(module, (nn.Linear, FP8Linear)):
         raise NotImplementedError
 
@@ -222,15 +232,15 @@ def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
     mask = mf_tool.sparse_tool.transform.postprocess(mask)
     # quant high
     hweight = mf_tool.high_quant_tool.transform.preprocess(hweight)
-    hweight, scale = mf_tool.high_quant_tool.sym_quant(hweight)
+    hweight, hscale = mf_tool.high_quant_tool.sym_quant(hweight)
     hweight = mf_tool.high_quant_tool.transform.postprocess(hweight).to(torch.int8)
-    hscale = mf_tool.high_quant_tool.transform.postprocess(scale).to(torch.bfloat16)
+    hscale = mf_tool.high_quant_tool.transform.postprocess(hscale).to(torch.bfloat16)
     # quant low
-    if config.sparsity > 0:
+    if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
         lweight = mf_tool.low_quant_tool.transform.preprocess(lweight)
-        lweight, scale = mf_tool.low_quant_tool.sym_quant(lweight)
+        lweight, lscale = mf_tool.low_quant_tool.sym_quant(lweight)
         lweight = mf_tool.low_quant_tool.transform.postprocess(lweight).to(torch.int8)
-        lscale = mf_tool.low_quant_tool.transform.postprocess(scale).to(torch.bfloat16)
+        lscale = mf_tool.low_quant_tool.transform.postprocess(lscale).to(torch.bfloat16)
     else:
         lweight, lscale = 0, 0
 
@@ -241,14 +251,14 @@ def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
     module.weight_scale_inv = nn.Parameter(
         hscale.to(module.weight_scale_inv.device, torch.bfloat16)
     )
-    if config.sparsity > 0:
+    if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
         # module.register_parameter(
         #     "lweight", nn.Parameter(
         #         lweight.to(module.weight.device), requires_grad=False
         #     )
         # )
         module.register_parameter(
-            "lweight_scale_inv", nn.Parameter(
+            "weight_lscale_inv", nn.Parameter(
                 lscale.to(module.weight_scale_inv.device, torch.bfloat16)
             )
         )
@@ -279,24 +289,24 @@ def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
             )
     else:
         # module.lweight = torch.tensor(0, dtype=torch.int8)
-        module.lweight_scale_inv = torch.tensor(0, dtype=torch.bfloat16)
+        module.weight_lscale_inv = torch.tensor(0, dtype=torch.bfloat16)
         module.mask = torch.tensor(1, dtype=torch.int8)
 
     new_weight = module.weight.to(torch.bfloat16) * \
         module.weight_scale_inv.to(torch.bfloat16).repeat_interleave(
-            64, dim=-1
+            mf_tool.bank_size, dim=-1
         ) * mask.to(torch.bfloat16)
 
-    if config.sparsity > 0:
+    if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
         new_weight += module.weight.to(torch.bfloat16) * \
-            module.lweight_scale_inv.to(torch.bfloat16).repeat_interleave(
-                64, dim=-1
+            module.weight_lscale_inv.to(torch.bfloat16).repeat_interleave(
+                mf_tool.bank_size, dim=-1
             ) * (1 - mask).to(torch.bfloat16)
         
     if "experts." not in name and smooth:
-        smooth_scale = tool.module.smooth_scale
+        smooth_scale = tool.module.smooth_scale.clone()
         module.smooth_scale = nn.Parameter(
-            smooth_scale.to(smooth_scale.device), requires_grad=False
+            smooth_scale.to(module.weight.device), requires_grad=False
         )
         new_weight = new_weight / module.smooth_scale
 
@@ -475,7 +485,7 @@ def run(
         "quant_method": "blockwise_int8",
         "smooth": smooth,
         "w_sparsity": sparsity,
-        # "w_low_bits": low_bits,
+        "w_low_bits": low_bits,
         "mask_in_id": mask_in_id and sparsity > 0,
         "weight_block_size": [
             1,
@@ -494,15 +504,18 @@ if __name__ == "__main__":
     args_cache, kwargs_cache = load_cache(cache_file)
 
     model_name_or_path = "/ssd01/models/DeepSeek-V3.1-Terminus"
+    # model_name_or_path = "/ssd01/models/DeepSeek-V3.2-Exp"
+    # model = AutoModelForCausalLM.from_pretrained(
     model = DeepseekV3ForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype="auto",
-        device_map="cpu"
+        device_map="cpu",
+        trust_remote_code=True
     )
     # tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     
     num_layers = 4
-    # num_samples = 1
+    num_samples = 1
     num_layers = len(model.model.layers)
     num_samples = len(args_cache)
     
@@ -516,8 +529,7 @@ if __name__ == "__main__":
     sparsity = 0
     sparsity = 0.875
     high_bits = 8
-    low_bits = 3
-    # low_bits = 8
+    low_bits = 3 if sparsity != 0 else 0
     compress_config = get_compress_config(sparsity, high_bits, low_bits)
 
     # partial_save = False
@@ -525,10 +537,12 @@ if __name__ == "__main__":
 
     mask_in_id = False
     mask_in_id = True
-    
-    out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus-model"
-    # out_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Int8-smooth"
-    out_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-W8xH8L3"
+
+    model_name = os.path.basename(model_name_or_path)
+    out_dir = f"/ssd01/workspace/sglang-n/exp/data/{model_name}-model"
+    # out_dir = f"/ssd01/models/{model_name}-MF-Int8"
+    # out_dir = f"/ssd01/models/{model_name}-MF-Int8-smooth"
+    out_dir = f"/ssd01/models/{model_name}-MF-W8xH8L3"
     run(
         model,
         args_cache,
@@ -551,14 +565,15 @@ if __name__ == "__main__":
         "inference"
     ]
     for filepath in file_list:
-        if os.path.isdir(os.path.join(model_name_or_path, filepath)):
-            shutil.copytree(
-                os.path.join(model_name_or_path, filepath),
-                os.path.join(out_dir, filepath),
-                dirs_exist_ok=True
-            )
-        else:
-            shutil.copy(
-                os.path.join(model_name_or_path, filepath),
-                os.path.join(out_dir, filepath)
-            )
+        if os.path.exists(os.path.join(model_name_or_path, filepath)):
+            if os.path.isdir(os.path.join(model_name_or_path, filepath)):
+                shutil.copytree(
+                    os.path.join(model_name_or_path, filepath),
+                    os.path.join(out_dir, filepath),
+                    dirs_exist_ok=True
+                )
+            else:
+                shutil.copy(
+                    os.path.join(model_name_or_path, filepath),
+                    os.path.join(out_dir, filepath)
+                )

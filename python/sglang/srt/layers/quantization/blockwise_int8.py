@@ -247,7 +247,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 weight_loader=weight_loader,
             )
             lscale[:] = torch.finfo(scale_dtype).min
-            layer.register_parameter("lweight_scale_inv", lscale)
+            layer.register_parameter("weight_lscale_inv", lscale)
             # MASK
             if self.quant_config.mask_in_id:
                 # mask_id = _ColumnvLLMParameter(
@@ -290,7 +290,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 )
                 layer.register_parameter("mask", mask)
         else:
-            layer.lweight_scale_inv = None
+            layer.weight_lscale_inv = None
             layer.mask = 1
 
         # INPUT ACTIVATION SCALE
@@ -352,7 +352,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight * (1 - mask),
                 block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.lweight_scale_inv,
+                weight_scale=layer.weight_lscale_inv,
                 input_scale=None,
                 bias=bias,
                 mf_format=self.quant_config.mf_format
@@ -537,7 +537,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         # low bits part
         if self.quant_config.w_sparsity > 0:
             # WEIGHT_SCALES
-            w13_lweight_scale = torch.nn.Parameter(
+            w13_weight_lscale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
@@ -546,7 +546,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
-            w2_lweight_scale = torch.nn.Parameter(
+            w2_weight_lscale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
                     (hidden_size + block_n - 1) // block_n,
@@ -555,13 +555,13 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter("w13_lweight_scale_inv", w13_lweight_scale)
-            layer.register_parameter("w2_lweight_scale_inv", w2_lweight_scale)
-            set_weight_attrs(w13_lweight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_lweight_scale, extra_weight_attrs)
+            layer.register_parameter("w13_weight_lscale_inv", w13_weight_lscale)
+            layer.register_parameter("w2_weight_lscale_inv", w2_weight_lscale)
+            set_weight_attrs(w13_weight_lscale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_lscale, extra_weight_attrs)
         else:
-            layer.w13_lweight_scale_inv = None
-            layer.w2_lweight_scale_inv = None
+            layer.w13_weight_lscale_inv = None
+            layer.w2_weight_lscale_inv = None
 
         # INPUT_SCALES
         assert self.quant_config.activation_scheme == "dynamic"
@@ -646,8 +646,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_mask=w2_mask, # moffett
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
-            w13_lscale=layer.w13_lweight_scale_inv, # moffett
-            w2_lscale=layer.w2_lweight_scale_inv, # moffett
+            w13_lscale=layer.w13_weight_lscale_inv, # moffett
+            w2_lscale=layer.w2_weight_lscale_inv, # moffett
             mf_format=self.quant_config.mf_format, # moffett
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
