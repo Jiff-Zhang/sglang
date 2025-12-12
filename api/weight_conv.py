@@ -187,8 +187,14 @@ def register_compress_tool(
             )
     return hooks, tools
 
-def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
-    if "experts." not in name and smooth:
+def solve_weight(
+    name,
+    tool: CompressOPT,
+    smooth=True,
+    smooth_filters: list = [],
+    mask_in_id=False,
+):
+    if smooth and not any([item in name for item in smooth_filters]):
         if not getattr(tool, "already_smooth", False):
             tool.smooth()
             setattr(tool, "already_smooth", True)
@@ -303,7 +309,7 @@ def solve_weight(name, tool: CompressOPT, smooth=True, mask_in_id=False):
                 mf_tool.bank_size, dim=-1
             ) * (1 - mask).to(torch.bfloat16)
         
-    if "experts." not in name and smooth:
+    if smooth and not any([item in name for item in smooth_filters]):
         smooth_scale = tool.module.smooth_scale.clone()
         module.smooth_scale = nn.Parameter(
             smooth_scale.to(module.weight.device), requires_grad=False
@@ -421,8 +427,9 @@ def run(
     compress_config,
     out_dir,
     smooth=True,
+    smooth_filters=[],
     partial_save=False,
-    mask_in_id=False
+    mask_in_id=False,
 ):
     if partial_save:
         assert out_dir is not None
@@ -464,7 +471,13 @@ def run(
 
             for name, tool in tqdm(tools.items(), desc=f"Solving layer {layer_idx:2d}"):
                 tqdm.write(f"### Compressing: {name} ###")
-                solve_weight(name, tool, smooth=smooth, mask_in_id=mask_in_id)
+                solve_weight(
+                    name,
+                    tool,
+                    smooth=smooth,
+                    smooth_filters=smooth_filters,
+                    mask_in_id=mask_in_id,
+                )
             # with ProcessPoolExecutor(max_workers=cpu_count()//2) as executor:
             #     futures = list()
             #     for name, tool in tools.items():
@@ -524,7 +537,9 @@ if __name__ == "__main__":
     kwargs_cache = kwargs_cache[:num_samples]
 
     smooth = True
-    smooth = False
+    # smooth = False
+    smooth_filters = ['experts.']
+    smooth_filters = []
     
     sparsity = 0
     sparsity = 0.875
@@ -541,8 +556,9 @@ if __name__ == "__main__":
     model_name = os.path.basename(model_name_or_path)
     out_dir = f"/ssd01/workspace/sglang-n/exp/data/{model_name}-model"
     # out_dir = f"/ssd01/models/{model_name}-MF-Int8"
-    # out_dir = f"/ssd01/models/{model_name}-MF-Int8-smooth"
     out_dir = f"/ssd01/models/{model_name}-MF-W8xH8L3"
+    if smooth:
+        out_dir += "-smooth"
     run(
         model,
         args_cache,
@@ -551,8 +567,9 @@ if __name__ == "__main__":
         compress_config=compress_config,
         out_dir=out_dir,
         smooth=smooth,
+        smooth_filters=smooth_filters,
         partial_save=partial_save,
-        mask_in_id=mask_in_id
+        mask_in_id=mask_in_id,
     )
     # tokenizer.save_pretrained(out_dir)
     file_list = [

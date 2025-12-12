@@ -625,10 +625,7 @@ def invoke_fused_moe_kernel(
     if smooth_scale is None:
         A_repeated = False
     else:
-        gather_smooth_scale = rearrange(
-            smooth_scale[topk_ids],
-            'b k ... -> (b k) ...'
-        )
+        gather_smooth_scale = smooth_scale[topk_ids.view(-1)]
         A = A.repeat_interleave(top_k, dim=0) / gather_smooth_scale
         A_repeated = True
 
