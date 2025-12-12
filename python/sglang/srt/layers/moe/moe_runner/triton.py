@@ -103,8 +103,8 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     w2_zp: Optional[torch.Tensor] = None
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
-    a13_smooth_scale: Optional[torch.Tensor] = None # moffett: unimplemented
-    a2_smooth_scale: Optional[torch.Tensor] = None # moffett: unimplemented
+    a13_smooth_scale: Optional[torch.Tensor] = None # moffett
+    a2_smooth_scale: Optional[torch.Tensor] = None # moffett
     block_shape: Optional[List[int]] = None
 
 
@@ -365,6 +365,8 @@ def fused_experts_none_to_triton(
         w2_zp=quant_info.w2_zp,
         a1_scale=quant_info.a13_scale,
         a2_scale=quant_info.a2_scale,
+        a1_smooth_scale=quant_info.a13_smooth_scale, # moffett
+        a2_smooth_scale=quant_info.a2_smooth_scale, # moffett
         block_shape=quant_info.block_shape,
     )
 

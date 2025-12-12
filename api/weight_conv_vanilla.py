@@ -344,8 +344,9 @@ if __name__ == "__main__":
     in_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Int8"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-W8xH8L3"
-    # in_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp"
-    # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
+    in_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp"
+    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
+    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-W8xH8L3"
     
     # vanilla version
     sparsity = 0

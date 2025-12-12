@@ -300,7 +300,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         # SMOOTH SCALE
         if self.quant_config.smooth:
             smooth_scale = RowvLLMParameter(
-                data=torch.empty(
+                data=torch.ones(
                     1,
                     input_size_per_partition,
                     dtype=torch.bfloat16,
@@ -308,8 +308,10 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 input_dim=1,
                 weight_loader=weight_loader,
             )
-            smooth_scale[:] = torch.finfo(torch.bfloat16).min
+            # smooth_scale[:] = torch.finfo(torch.bfloat16).min
             layer.register_parameter("smooth_scale", smooth_scale)
+        else:
+            layer.smooth_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
@@ -570,12 +572,11 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         # SMOOTH SCALE
         # TODO: to be fixed
-        # if self.quant_config.smooth:
-        if False:
+        if self.quant_config.smooth:
             w13_smooth_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    1,
+                    2,
                     hidden_size,
                     dtype=scale_dtype,
                 ),
@@ -590,6 +591,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+            
             layer.register_parameter("w13_smooth_scale", w13_smooth_scale)
             layer.register_parameter("w2_smooth_scale", w2_smooth_scale)
             set_weight_attrs(w13_smooth_scale, extra_weight_attrs)
@@ -637,6 +639,16 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         else:
             w13_mask = layer.w13_mask
             w2_mask = layer.w2_mask
+
+        if self.quant_config.smooth:
+            assert torch.allclose(
+                layer.w13_smooth_scale[:, 0], layer.w13_smooth_scale[:, 1]
+            ), f"Find mismatch cases between gate_proj and up_proj within each expert."
+            w13_smooth_scale = layer.w13_smooth_scale[:, 0]
+            w2_smooth_scale = layer.w2_smooth_scale[:, 0]
+        else:
+            w13_smooth_scale = None
+            w2_smooth_scale = None
         
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -651,8 +663,8 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             mf_format=self.quant_config.mf_format, # moffett
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            a13_smooth_scale=layer.w13_smooth_scale, # moffett: unimplemented
-            a2_smooth_scale=layer.w2_smooth_scale, # moffett: unimplemented
+            a13_smooth_scale=w13_smooth_scale, # moffett
+            a2_smooth_scale=w2_smooth_scale, # moffett
             block_shape=self.quant_config.weight_block_size,
         )
 

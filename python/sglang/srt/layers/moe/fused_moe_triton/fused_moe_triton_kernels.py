@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from einops import rearrange
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -612,9 +613,24 @@ def invoke_fused_moe_kernel(
     b_use_tma: bool = False,
     c_sorted: bool = False,
     filter_expert: bool = True,
+    smooth_scale: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # smooth_scales = torch.ones(
+    #     (B.size(0), A.size(1)), dtype=A.dtype, device=A.device
+    # )
+    # assert smooth_scale is None or (smooth_scale == 1).all(), f"{smooth_scale}"
+    if smooth_scale is None:
+        A_repeated = False
+    else:
+        gather_smooth_scale = rearrange(
+            smooth_scale[topk_ids],
+            'b k ... -> (b k) ...'
+        )
+        A = A.repeat_interleave(top_k, dim=0) / gather_smooth_scale
+        A_repeated = True
 
     padded_size = 0
     if use_fp8_w8a8:
@@ -724,7 +740,7 @@ def invoke_fused_moe_kernel(
             B_zp.stride(1) if B_zp is not None else 0,
             group_size=block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
+            top_k=top_k if not A_repeated else 1,
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
@@ -791,7 +807,7 @@ def invoke_fused_moe_kernel(
             0 if block_shape is None else block_shape[0],
             0 if block_shape is None else block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
+            top_k=top_k if not A_repeated else 1,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
