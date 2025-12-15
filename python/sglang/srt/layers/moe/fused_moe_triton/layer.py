@@ -370,9 +370,9 @@ class FusedMoE(torch.nn.Module):
         if expert_data.size(shard_dim) == 2:
             # each w1 and w3 in all rank share the same parameter respectively
             tp_rank = 0
-            logger.warning(
-                f"Found parameter with 2 in shard dimension, set tp_rank to 0 to make sure each w1 and w3 in all rank load the same parameter respectively."
-            )
+            # logger.warning(
+            #     f"Found parameter with 2 in shard dimension, set tp_rank to 0 to make sure each w1 and w3 in all rank load the same parameter respectively."
+            # )
 
         if _is_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(

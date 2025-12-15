@@ -537,7 +537,7 @@ if __name__ == "__main__":
     kwargs_cache = kwargs_cache[:num_samples]
 
     smooth = True
-    # smooth = False
+    smooth = False
     smooth_filters = ['experts.']
     smooth_filters = []
     
