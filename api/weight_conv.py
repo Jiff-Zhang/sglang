@@ -69,6 +69,8 @@ def get_weight_pair(linears: List[Union[nn.Module, FP8Linear]]):
     return torch.cat([get_weight(linear) for linear in linears], dim=0)
 
 def get_compress_config(sparsity, high_bits, low_bits):
+    if sparsity == 0:
+        low_bits = 0
     compress_config = CompressConfig(
         general_linear=LinearConfig(
             inputs=SparseQuantizeConfig(
@@ -141,7 +143,7 @@ def add_batch(
 
 def register_compress_tool(
     layer: DeepseekV3DecoderLayer,
-    compress_config: CompressConfig
+    compress_configs: Dict[str, CompressConfig]
 ):
     hooks, tools = dict(), dict()
     share_pairs = [
@@ -168,6 +170,12 @@ def register_compress_tool(
                 # print(index, match_key, pair, tools[name].weight_slice)
 
             if name not in tools:
+                compress_config = compress_configs["linear"]
+                for key in compress_configs:
+                    if key in name:
+                        compress_config = compress_configs[key]
+                        break
+                    
                 tools[name] = get_compress_tool(
                     modules, compress_config=compress_config
                 )
@@ -317,9 +325,9 @@ def solve_weight(
         new_weight = new_weight / module.smooth_scale
 
     diff = ori_weight - new_weight
-    print(f"diff mean: {diff.abs().mean():.4f}\tdiff max: {diff.abs().max():.4f}")
-    print(f"ori mean: {ori_weight.mean():.4f}\tori max: {ori_weight.max():.4f}")
-    print(f"new mean: {new_weight.mean():.4f}\tnew max: {new_weight.max():.4f}")
+    print(f"diff mean: {diff.abs().mean():.5f}\tdiff max: {diff.abs().max():.5f}")
+    print(f"ori mean: {ori_weight.mean():.5f}\tori max: {ori_weight.max():.5f}")
+    print(f"new mean: {new_weight.mean():.5f}\tnew max: {new_weight.max():.5f}")
     
 def cuda_hook(
     module: nn.Module,
@@ -424,13 +432,23 @@ def run(
     args_cache,
     kwargs_cache,
     device,
-    compress_config,
+    sparsity: dict,
+    high_bits: int,
+    low_bits: int,
     out_dir,
     smooth=True,
     smooth_filters=[],
     partial_save=False,
     mask_in_id=False,
 ):
+    compress_configs = {
+        "experts": get_compress_config(
+            sparsity["experts"], high_bits, low_bits
+        ),
+        "linear": get_compress_config(
+            sparsity["linear"], high_bits, low_bits
+        )
+    }
     if partial_save:
         assert out_dir is not None
         saver = ModelSaver(model, out_dir=out_dir)
@@ -444,7 +462,7 @@ def run(
     with torch.no_grad():
         for layer_idx, layer in enumerate(model.model.layers):
             hooks, tools = register_compress_tool(
-                layer, compress_config=compress_config
+                layer, compress_configs=compress_configs
             )
             
             if smooth:
@@ -499,7 +517,8 @@ def run(
         "smooth": smooth,
         "w_sparsity": sparsity,
         "w_low_bits": low_bits,
-        "mask_in_id": mask_in_id and sparsity > 0,
+        # "mask_in_id": mask_in_id and sparsity > 0,
+        "mask_in_id": mask_in_id,
         "weight_block_size": [
             1,
             64
@@ -541,11 +560,12 @@ if __name__ == "__main__":
     smooth_filters = ['experts.']
     smooth_filters = []
     
-    sparsity = 0
-    sparsity = 0.875
+    sparsity = {
+        "linear": 0,
+        "experts": 0.875 
+    }
     high_bits = 8
-    low_bits = 3 if sparsity != 0 else 0
-    compress_config = get_compress_config(sparsity, high_bits, low_bits)
+    low_bits = 3
 
     # partial_save = False
     partial_save = True
@@ -556,7 +576,8 @@ if __name__ == "__main__":
     model_name = os.path.basename(model_name_or_path)
     out_dir = f"/ssd01/workspace/sglang-n/exp/data/{model_name}-model"
     # out_dir = f"/ssd01/models/{model_name}-MF-Int8"
-    out_dir = f"/ssd01/models/{model_name}-MF-W8xH8L3"
+    # out_dir = f"/ssd01/models/{model_name}-MF-W8xH8L3"
+    out_dir = f"/ssd01/models/{model_name}-MF-Linear_WInt8-MOE_W8xH8L3"
     if smooth:
         out_dir += "-smooth"
     run(
@@ -564,7 +585,9 @@ if __name__ == "__main__":
         args_cache,
         kwargs_cache,
         device,
-        compress_config=compress_config,
+        sparsity=sparsity,
+        high_bits=high_bits,
+        low_bits=low_bits,
         out_dir=out_dir,
         smooth=smooth,
         smooth_filters=smooth_filters,

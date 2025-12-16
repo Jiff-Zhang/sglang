@@ -119,10 +119,29 @@ class ModelSaver:
 def run(
     in_weight_dir: str,
     out_weight_dir: str,
-    mf_tool: MFSparseNbits,
+    sparsity: Dict[str, float],
+    high_bits: int,
+    low_bits: int,
+    bank_size: int,
     mask_in_id: bool=True,
     partial_save: bool=False
 ):
+    dtypes = {
+        "high": "none" if high_bits == 16 else f"int{high_bits}",
+        "low": "zero" if low_bits == 0 else f"int{low_bits}"
+    }
+    mf_tools = {
+        key: MFSparseNbits(
+            sparsity = sparsity[key],
+            bank_size=bank_size,
+            sparse_mode="per_bank",
+            quant_mode="per_bank",
+            dtypes=dtypes,
+            quant_symmetric=True,
+            quant_masked=True
+        )
+        for key in sparsity
+    }
     weights, weight_map, weight_map_ref = load_weights(in_weight_dir)
     w_block = [128, 128]
 
@@ -161,6 +180,12 @@ def run(
 
                 ori_weight = weight
 
+                mf_tool = mf_tools["linear"]
+                for k in mf_tools:
+                    if k in name:
+                        mf_tool = mf_tools[k]
+                        break
+                
                 # quantize: int8 weight + bfloat16 scale
                 # split to high and low
                 hweight = mf_tool.sparse_tool.transform.preprocess(weight)
@@ -315,7 +340,7 @@ def save_extra(
                         "smooth": False,
                         "w_sparsity": sparsity,
                         "w_low_bits": low_bits,
-                        "mask_in_id": mask_in_id and sparsity > 0,
+                        "mask_in_id": mask_in_id,
                         "weight_block_size": [
                             1,
                             bank_size
@@ -347,35 +372,28 @@ if __name__ == "__main__":
     in_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-W8xH8L3"
+    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
-    sparsity = 0
-    sparsity = 0.875
+    sparsity = {
+        "linear": 0,
+        "experts": 0.875 
+    }
     bank_size = 64
     high_bits = 8
-    low_bits = 3 if sparsity > 0 else 0
+    low_bits = 3
     mask_in_id = False
     mask_in_id = True
     partial_save = False
     partial_save = True
     
-    dtypes = {
-        "high": "none" if high_bits == 16 else f"int{high_bits}",
-        "low": "zero" if low_bits == 0 else f"int{low_bits}"
-    }
-    mf_tool = MFSparseNbits(
-        sparsity = sparsity,
-        bank_size=bank_size,
-        sparse_mode="per_bank",
-        quant_mode="per_bank",
-        dtypes=dtypes,
-        quant_symmetric=True,
-        quant_masked=True
-    )
     run(
         in_weight_dir,
         out_weight_dir,
-        mf_tool,
+        sparsity=sparsity,
+        high_bits=high_bits,
+        low_bits=low_bits,
+        bank_size=bank_size,
         mask_in_id=mask_in_id,
         partial_save=partial_save
     )
