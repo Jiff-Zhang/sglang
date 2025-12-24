@@ -367,6 +367,13 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
+        if expert_data.size(shard_dim) == 2:
+            # each w1 and w3 in all rank share the same parameter respectively
+            tp_rank = 0
+            # logger.warning(
+            #     f"Found parameter with 2 in shard dimension, set tp_rank to 0 to make sure each w1 and w3 in all rank load the same parameter respectively."
+            # )
+
         if _is_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
@@ -777,8 +784,9 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Case model weights
-        if "weight" in weight_name:
+        # Case model weights or mask or mask_id
+        # if "weight" in weight_name:
+        if "weight" in weight_name or "mask" in weight_name:
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -787,6 +795,9 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
             return
+        raise NotImplementedError(
+            f"Found unsupported weight name: {weight_name}"
+        )
 
     def weight_loader_fused(
         self,

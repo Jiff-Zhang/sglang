@@ -74,12 +74,19 @@ def inplace_fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
+    w1_mask: Optional[torch.Tensor] = None, # moffett
+    w2_mask: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_lscale: Optional[torch.Tensor] = None, # moffett
+    w2_lscale: Optional[torch.Tensor] = None, # moffett
+    mf_format: bool = False, # moffett
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    a1_smooth_scale: Optional[torch.Tensor] = None, # moffett
+    a2_smooth_scale: Optional[torch.Tensor] = None, # moffett
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
@@ -87,34 +94,41 @@ def inplace_fused_experts(
     filter_expert: bool = True,
 ) -> None:
     fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        b1,
-        b2,
-        True,
-        activation,
-        is_gated,
-        apply_router_weight_on_input,
-        use_fp8_w8a8,
-        use_int8_w8a8,
-        use_int8_w8a16,
-        use_int4_w4a16,
-        per_channel_quant,
-        w1_scale,
-        w2_scale,
-        w1_zp,
-        w2_zp,
-        a1_scale,
-        a2_scale,
-        block_shape,
-        False,
-        routed_scaling_factor,
-        gemm1_alpha,
-        gemm1_limit,
-        filter_expert,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        b1=b1,
+        b2=b2,
+        inplace=True,
+        activation=activation,
+        is_gated=is_gated,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_mask=w1_mask, # moffett
+        w2_mask=w2_mask, # moffett
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_lscale=w1_lscale, # moffett
+        w2_lscale=w2_lscale, # moffett
+        mf_format=mf_format, # moffett
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        a1_smooth_scale=a1_smooth_scale, # moffett
+        a2_smooth_scale=a2_smooth_scale, # moffett
+        block_shape=block_shape,
+        no_combine=False,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        filter_expert=filter_expert,
     )
 
 
@@ -173,12 +187,19 @@ def outplace_fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
+    w1_mask: Optional[torch.Tensor] = None, # moffett
+    w2_mask: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_lscale: Optional[torch.Tensor] = None, # moffett
+    w2_lscale: Optional[torch.Tensor] = None, # moffett
+    mf_format: bool = False, # moffett
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    a1_smooth_scale: Optional[torch.Tensor] = None, # moffett
+    a2_smooth_scale: Optional[torch.Tensor] = None, # moffett
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
@@ -187,29 +208,36 @@ def outplace_fused_experts(
     filter_expert: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        b1,
-        b2,
-        False,
-        activation,
-        is_gated,
-        apply_router_weight_on_input,
-        use_fp8_w8a8,
-        use_int8_w8a8,
-        use_int8_w8a16,
-        use_int4_w4a16,
-        per_channel_quant,
-        w1_scale,
-        w2_scale,
-        w1_zp,
-        w2_zp,
-        a1_scale,
-        a2_scale,
-        block_shape,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        b1=b1,
+        b2=b2,
+        inplace=False,
+        activation=activation,
+        is_gated=is_gated,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_mask=w1_mask, # moffett
+        w2_mask=w2_mask, # moffett
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_lscale=w1_lscale, # moffett
+        w2_lscale=w2_lscale, # moffett
+        mf_format=mf_format, # moffett
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        a1_smooth_scale=a1_smooth_scale, # moffett
+        a2_smooth_scale=a2_smooth_scale, # moffett
+        block_shape=block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
@@ -271,12 +299,19 @@ def fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
+    w1_mask: Optional[torch.Tensor] = None, # moffett
+    w2_mask: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_lscale: Optional[torch.Tensor] = None, # moffett
+    w2_lscale: Optional[torch.Tensor] = None, # moffett
+    mf_format: bool = False, # moffett
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    a1_smooth_scale: Optional[torch.Tensor] = None, # moffett
+    a2_smooth_scale: Optional[torch.Tensor] = None, # moffett
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
@@ -287,57 +322,71 @@ def fused_experts(
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            b1,
-            b2,
-            moe_runner_config.activation,
-            moe_runner_config.is_gated,
-            moe_runner_config.apply_router_weight_on_input,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            per_channel_quant,
-            w1_scale,
-            w2_scale,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
-            moe_runner_config.routed_scaling_factor,
-            moe_runner_config.gemm1_alpha,
-            moe_runner_config.gemm1_clamp_limit,
-            filter_expert,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            b1=b1,
+            b2=b2,
+            activation=moe_runner_config.activation,
+            is_gated=moe_runner_config.is_gated,
+            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            w1_mask=w1_mask, # moffett
+            w2_mask=w2_mask, # moffett
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_lscale=w1_lscale, # moffett
+            w2_lscale=w2_lscale, # moffett
+            mf_format=mf_format, # moffett
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            a1_smooth_scale=a1_smooth_scale, # moffett
+            a2_smooth_scale=a2_smooth_scale, # moffett
+            block_shape=block_shape,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
         )
         return hidden_states
     else:
         return torch.ops.sglang.outplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            b1,
-            b2,
-            moe_runner_config.activation,
-            moe_runner_config.apply_router_weight_on_input,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            per_channel_quant,
-            w1_scale,
-            w2_scale,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            b1=b1,
+            b2=b2,
+            activation=moe_runner_config.activation,
+            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            w1_mask=w1_mask, # moffett
+            w2_mask=w2_mask, # moffett
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_lscale=w1_lscale, # moffett
+            w2_lscale=w2_lscale, # moffett
+            mf_format=mf_format, # moffett
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            a1_smooth_scale=a1_smooth_scale, # moffett
+            a2_smooth_scale=a2_smooth_scale, # moffett
+            block_shape=block_shape,
             no_combine=moe_runner_config.no_combine,
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
@@ -382,12 +431,19 @@ def fused_experts_impl(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
+    w1_mask: Optional[torch.Tensor] = None, # moffett
+    w2_mask: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_lscale: Optional[torch.Tensor] = None, # moffett
+    w2_lscale: Optional[torch.Tensor] = None, # moffett
+    mf_format: bool = False,
     w1_zp: Optional[torch.Tensor] = None,
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    a1_smooth_scale: Optional[torch.Tensor] = None, # moffett
+    a2_smooth_scale: Optional[torch.Tensor] = None, # moffett
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
@@ -516,32 +572,49 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        invoke_fused_moe_kernel(
-            curr_hidden_states,
-            w1,
-            b1,
-            intermediate_cache1,
-            a1_scale,
-            w1_scale,
-            w1_zp,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            c_sorted=down_moe_use_tma,
-            filter_expert=filter_expert,
-        )
+        if w1_mask is not None:
+            assert w1_lscale is not None
+            w1_list = [w1 * w1_mask, w1 * (1 - w1_mask)]
+            b1_list = [None, b1]
+            w1_scale_list = [w1_scale, w1_lscale]
+        else:
+            w1_list = [w1]
+            b1_list = [b1]
+            w1_scale_list = [w1_scale]
+        intermediate_cache1.zero_()
+        intermediate_cache1_p = torch.empty_like(intermediate_cache1)
+        for w1_p, b1_p, w1_scale_p in zip(w1_list, b1_list, w1_scale_list):
+            invoke_fused_moe_kernel(
+                curr_hidden_states,
+                w1_p,
+                b1_p,
+                intermediate_cache1_p,
+                a1_scale,
+                w1_scale_p,
+                w1_zp,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                mf_format=mf_format,
+                c_sorted=down_moe_use_tma,
+                filter_expert=filter_expert,
+                smooth_scale=a1_smooth_scale
+            )
+            intermediate_cache1.data += intermediate_cache1_p
+        del w1_list, b1_list, w1_scale_list, intermediate_cache1_p
+        
         # Activation function with multiplication
         if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
@@ -575,38 +648,55 @@ def fused_experts_impl(
             intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
-
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            b2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
-            ),
-            a2_scale,
-            w2_scale,
-            w2_zp,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            down_config or config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            a_use_tma=down_moe_use_tma,
-            b_use_tma=down_moe_use_tma,
-            filter_expert=filter_expert,
+        
+        if w2_mask is not None:
+            assert w2_lscale is not None
+            w2_list = [w2 * w2_mask, w2 * (1 - w2_mask)]
+            b2_list = [None, b2]
+            w2_scale_list = [w2_scale, w2_lscale]
+        else:
+            w2_list = [w2]
+            b2_list = [b2]
+            w2_scale_list = [w2_scale]
+        output_cache = (
+            intermediate_cache3
+            if not no_combine and topk_ids.shape[1] != 1
+            else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
         )
+        output_cache.zero_()
+        output_cache_p = torch.empty_like(output_cache)
+        for w2_p, b2_p, w2_scale_p in zip(w2_list, b2_list, w2_scale_list):
+            invoke_fused_moe_kernel(
+                intermediate_cache2,
+                w2_p,
+                b2_p,
+                output_cache_p,
+                a2_scale,
+                w2_scale_p,
+                w2_zp,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                down_config or config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                mf_format=mf_format,
+                a_use_tma=down_moe_use_tma,
+                b_use_tma=down_moe_use_tma,
+                filter_expert=filter_expert,
+                smooth_scale=a2_smooth_scale
+            )
+            output_cache.data += output_cache_p
+        del w2_list, b2_list, w2_scale_list, output_cache_p
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0

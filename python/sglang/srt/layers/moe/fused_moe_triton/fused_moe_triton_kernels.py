@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from einops import rearrange
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -606,14 +607,27 @@ def invoke_fused_moe_kernel(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
+    mf_format: bool = False,
     no_combine: bool = False,
     a_use_tma: bool = False,
     b_use_tma: bool = False,
     c_sorted: bool = False,
     filter_expert: bool = True,
+    smooth_scale: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # smooth_scales = torch.ones(
+    #     (B.size(0), A.size(1)), dtype=A.dtype, device=A.device
+    # )
+    # assert smooth_scale is None or (smooth_scale == 1).all(), f"{smooth_scale}"
+    if smooth_scale is None:
+        A_repeated = False
+    else:
+        gather_smooth_scale = smooth_scale[topk_ids.view(-1)]
+        A = A.repeat_interleave(top_k, dim=0) / gather_smooth_scale
+        A_repeated = True
 
     padded_size = 0
     if use_fp8_w8a8:
@@ -648,10 +662,23 @@ def invoke_fused_moe_kernel(
             # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            if mf_format:
+                from sparseopt.attns.act_sparse_nbits import QuantTool
+                tool = QuantTool(
+                    mode="per_bank",
+                    dtype="int8",
+                    bank_size=block_k,
+                    symmetric=True
+                )
+                A = tool.transform.preprocess(A)
+                A, A_scale = tool.sym_quant(A)
+                A = tool.transform.postprocess(A).to(torch.int8)
+                A_scale = tool.transform.postprocess(A_scale)
             else:
-                A, A_scale = per_token_group_quant_int8(A, block_k)
+                if _is_cuda:
+                    A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_int8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -710,7 +737,7 @@ def invoke_fused_moe_kernel(
             B_zp.stride(1) if B_zp is not None else 0,
             group_size=block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
+            top_k=top_k if not A_repeated else 1,
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
@@ -777,7 +804,7 @@ def invoke_fused_moe_kernel(
             0 if block_shape is None else block_shape[0],
             0 if block_shape is None else block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
+            top_k=top_k if not A_repeated else 1,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
