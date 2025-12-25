@@ -2439,6 +2439,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                     ).transpose(0, 1),
                 )
         output, _ = self.o_proj(attn_bmm_output)
+        mf_save(
+            attn_bmm_output,
+            name=f"attn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            output,
+            name=f"attn-o_proj",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         return output
 
@@ -2698,7 +2712,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_bmm_output)
         mf_save(
             output,
-            name=f"o_proj",
+            name=f"attn-o_proj",
             layer_id=self.layer_id,
             gather=False
         )
