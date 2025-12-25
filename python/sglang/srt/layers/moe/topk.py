@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.mf_tool import fp32_to_fp24
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -941,6 +942,9 @@ def select_experts(
             info=expert_location_dispatch_info,
         )
     )
+
+    router_logits = fp32_to_fp24(router_logits)
+    correction_bias = fp32_to_fp24(correction_bias)
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
