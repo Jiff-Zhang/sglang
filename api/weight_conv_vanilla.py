@@ -138,7 +138,8 @@ def run(
             quant_mode="per_bank",
             dtypes=dtypes,
             quant_symmetric=True,
-            quant_masked=True
+            quant_masked=True,
+            hardware=True
         )
         for key in sparsity
     }
@@ -369,14 +370,17 @@ if __name__ == "__main__":
     in_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Int8"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-W8xH8L3"
-    in_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp"
-    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
-    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-W8xH8L3"
-    out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Linear_WInt8-MOE_W8xH8L3"
+    # out_weight_dir = "/ssd01/models/DeepSeek-V3.1-Terminus-MF-Linear_WInt8-MOE_W8xH8L3"
+    
+    # in_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp"
+    # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
+    # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-W8xH8L3"
+    # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
     sparsity = {
-        "linear": 0,
+        # "linear": 0,
+        "linear": 0.875,
         "experts": 0.875 
     }
     bank_size = 64

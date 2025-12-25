@@ -226,7 +226,8 @@ def solve_weight(
         quant_mode="per_bank",
         dtypes=dtypes,
         quant_symmetric=True,
-        quant_masked=True
+        quant_masked=True,
+        hardware=True
     )
 
     module = tool.ori_modules[module_id]

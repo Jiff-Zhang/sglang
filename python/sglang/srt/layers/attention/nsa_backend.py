@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-from sglang.srt.mf_tool import is_logging_enabled
+from sglang.srt.mf_tool import is_logging_enabled, fp32_to_fp24 
 
 _is_hip = is_hip()
 logger = logging.getLogger(__name__)
@@ -173,6 +173,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
     ) -> torch.Tensor:
+        logits = fp32_to_fp24(logits)
+        
         from sgl_kernel import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
