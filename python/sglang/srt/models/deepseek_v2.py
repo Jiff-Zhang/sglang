@@ -580,7 +580,7 @@ class DeepseekV2MLP(nn.Module):
         )
         mf_save(
             x,
-            name=f"mlp-moe-shared_experts-down_proj" if "shared_experts" in self.prefix else f"mlp-down_proj",
+            name=f"mlp-moe-shared_experts-down" if "shared_experts" in self.prefix else f"mlp-down",
             layer_id=self.layer_id,
             gather=False,
         )
@@ -1861,7 +1861,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora = self.q_a_layernorm(q)
                 mf_save(
                     self.q_b_proj(q_lora)[0],
-                    name=f"attn-q_b_proj",
+                    name=f"attn-q_b",
                     layer_id=self.layer_id,
                     gather=True,
                     dim=-1,
@@ -1895,7 +1895,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
                 mf_save(
                     self.q_b_proj(q)[0],
-                    name=f"attn-q_b_proj",
+                    name=f"attn-q_b",
                     layer_id=self.layer_id,
                     gather=True,
                     dim=-1,
@@ -1906,7 +1906,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q = self.q_a_layernorm(q)
                 mf_save(
                     self.q_b_proj(q)[0],
-                    name=f"attn-q_b_proj",
+                    name=f"attn-q_b",
                     layer_id=self.layer_id,
                     gather=True,
                     dim=-1,
@@ -2009,7 +2009,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         mf_save(
             output,
-            name=f"o_proj",
+            name=f"attn-o",
             layer_id=self.layer_id,
             gather=False
         )
@@ -2131,7 +2131,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             mf_save(
                 self.q_b_proj(q)[0],
-                name=f"attn-q_b_proj",
+                name=f"attn-q_b",
                 layer_id=self.layer_id,
                 gather=True,
                 dim=-1,
@@ -2449,7 +2449,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         mf_save(
             output,
-            name=f"attn-o_proj",
+            name=f"attn-o",
             layer_id=self.layer_id,
             gather=False
         )
@@ -2712,7 +2712,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_bmm_output)
         mf_save(
             output,
-            name=f"attn-o_proj",
+            name=f"attn-o",
             layer_id=self.layer_id,
             gather=False
         )
@@ -3114,7 +3114,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         mf_save(
             output,
-            name=f"o_proj",
+            name=f"attn-o",
             layer_id=self.layer_id,
             gather=False
         )
