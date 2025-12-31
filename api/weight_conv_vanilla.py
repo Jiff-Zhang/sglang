@@ -188,6 +188,9 @@ def run(
                         break
                 
                 # quantize: int8 weight + bfloat16 scale
+                scale_dtype = torch.float32
+                scale_dtype = torch.bfloat16
+                
                 # split to high and low
                 hweight = mf_tool.sparse_tool.transform.preprocess(weight)
                 hweight, lweight, mask = mf_tool.sparse_tool(hweight)
@@ -198,13 +201,13 @@ def run(
                 hweight = mf_tool.high_quant_tool.transform.preprocess(hweight)
                 hweight, hscale = mf_tool.high_quant_tool.sym_quant(hweight)
                 hweight = mf_tool.high_quant_tool.transform.postprocess(hweight).to(torch.int8)
-                hscale = mf_tool.high_quant_tool.transform.postprocess(hscale).to(torch.bfloat16)
+                hscale = mf_tool.high_quant_tool.transform.postprocess(hscale).to(scale_dtype)
                 # quant low
                 if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
                     lweight = mf_tool.low_quant_tool.transform.preprocess(lweight)
                     lweight, lscale = mf_tool.low_quant_tool.sym_quant(lweight)
                     lweight = mf_tool.low_quant_tool.transform.postprocess(lweight).to(torch.int8)
-                    lscale = mf_tool.low_quant_tool.transform.postprocess(lscale).to(torch.bfloat16)
+                    lscale = mf_tool.low_quant_tool.transform.postprocess(lscale).to(scale_dtype)
                     if mask_in_id:
                         # [O, NB, BankSize]
                         mask = mf_tool.sparse_tool.transform.preprocess(mask)
@@ -220,21 +223,21 @@ def run(
                         assert (mask == mask_n).all()
                 else:
                     # module.lweight = torch.tensor(0, dtype=torch.int8)
-                    lscale = torch.tensor(0, dtype=torch.bfloat16)
+                    lscale = torch.tensor(0, dtype=scale_dtype)
                     mask = torch.tensor(1, dtype=torch.int8)
 
                 weight = (hweight * mask + lweight * (1 - mask)).to(torch.int8)
                 
-                new_weight = weight.to(torch.bfloat16) * \
-                    hscale.to(torch.bfloat16).repeat_interleave(
+                new_weight = weight.to(scale_dtype) * \
+                    hscale.to(scale_dtype).repeat_interleave(
                         mf_tool.bank_size, dim=-1
-                    ) * mask.to(torch.bfloat16)
+                    ) * mask.to(scale_dtype)
 
                 if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
-                    new_weight += weight.to(torch.bfloat16) * \
-                        lscale.to(torch.bfloat16).repeat_interleave(
+                    new_weight += weight.to(scale_dtype) * \
+                        lscale.to(scale_dtype).repeat_interleave(
                             mf_tool.bank_size, dim=-1
-                        ) * (1 - mask).to(torch.bfloat16)
+                        ) * (1 - mask).to(scale_dtype)
                         
                 ori_weight = ori_weight.view(-1)
                 new_weight = new_weight.view(-1)
@@ -250,7 +253,7 @@ def run(
                 )
 
                 # update weights
-                set_tensor(weights, weight_map, weight_map_ref, s_name, hscale.to(torch.bfloat16))
+                set_tensor(weights, weight_map, weight_map_ref, s_name, hscale.to(scale_dtype))
                 set_tensor(weights, weight_map, weight_map_ref, w_name, weight.to(torch.int8))
                 if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
                     set_tensor(
@@ -258,7 +261,7 @@ def run(
                         weight_map, 
                         weight_map_ref,
                         s_name.replace(".weight_scale_inv", ".weight_lscale_inv"),
-                        lscale.to(torch.bfloat16),
+                        lscale.to(scale_dtype),
                         key=s_name
                     )
                     if mask_in_id:

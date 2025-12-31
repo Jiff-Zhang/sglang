@@ -239,6 +239,9 @@ def solve_weight(
         raise NotImplementedError
 
     # quantize: int8 weight + bfloat16 scale
+    scale_dtype = torch.float32
+    scale_dtype = torch.bfloat16
+    
     # split to high and low
     hweight = mf_tool.sparse_tool.transform.preprocess(weight)
     hweight, lweight, mask = mf_tool.sparse_tool(hweight)
@@ -249,22 +252,22 @@ def solve_weight(
     hweight = mf_tool.high_quant_tool.transform.preprocess(hweight)
     hweight, hscale = mf_tool.high_quant_tool.sym_quant(hweight)
     hweight = mf_tool.high_quant_tool.transform.postprocess(hweight).to(torch.int8)
-    hscale = mf_tool.high_quant_tool.transform.postprocess(hscale).to(torch.bfloat16)
+    hscale = mf_tool.high_quant_tool.transform.postprocess(hscale).to(scale_dtype)
+    module.weight_scale_inv = nn.Parameter(
+        hscale.to(module.weight_scale_inv.device, scale_dtype)
+    )
     # quant low
     if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
         lweight = mf_tool.low_quant_tool.transform.preprocess(lweight)
         lweight, lscale = mf_tool.low_quant_tool.sym_quant(lweight)
         lweight = mf_tool.low_quant_tool.transform.postprocess(lweight).to(torch.int8)
-        lscale = mf_tool.low_quant_tool.transform.postprocess(lscale).to(torch.bfloat16)
+        lscale = mf_tool.low_quant_tool.transform.postprocess(lscale).to(scale_dtype)
     else:
         lweight, lscale = 0, 0
 
     weight = (hweight * mask + lweight * (1 - mask)).to(torch.int8)
     module.weight = nn.Parameter(
         weight.to(module.weight.device, torch.int8), requires_grad=False
-    )
-    module.weight_scale_inv = nn.Parameter(
-        hscale.to(module.weight_scale_inv.device, torch.bfloat16)
     )
     if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
         # module.register_parameter(
@@ -274,7 +277,7 @@ def solve_weight(
         # )
         module.register_parameter(
             "weight_lscale_inv", nn.Parameter(
-                lscale.to(module.weight_scale_inv.device, torch.bfloat16)
+                lscale.to(module.weight_scale_inv.device, scale_dtype)
             )
         )
         if mask_in_id:
@@ -304,19 +307,19 @@ def solve_weight(
             )
     else:
         # module.lweight = torch.tensor(0, dtype=torch.int8)
-        module.weight_lscale_inv = torch.tensor(0, dtype=torch.bfloat16)
+        module.weight_lscale_inv = torch.tensor(0, dtype=scale_dtype)
         module.mask = torch.tensor(1, dtype=torch.int8)
 
-    new_weight = module.weight.to(torch.bfloat16) * \
-        module.weight_scale_inv.to(torch.bfloat16).repeat_interleave(
+    new_weight = module.weight.to(scale_dtype) * \
+        module.weight_scale_inv.to(scale_dtype).repeat_interleave(
             mf_tool.bank_size, dim=-1
-        ) * mask.to(torch.bfloat16)
+        ) * mask.to(scale_dtype)
 
     if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
-        new_weight += module.weight.to(torch.bfloat16) * \
-            module.weight_lscale_inv.to(torch.bfloat16).repeat_interleave(
+        new_weight += module.weight.to(scale_dtype) * \
+            module.weight_lscale_inv.to(scale_dtype).repeat_interleave(
                 mf_tool.bank_size, dim=-1
-            ) * (1 - mask).to(torch.bfloat16)
+            ) * (1 - mask).to(scale_dtype)
         
     if smooth and not any([item in name for item in smooth_filters]):
         smooth_scale = tool.module.smooth_scale.clone()
