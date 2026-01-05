@@ -24,13 +24,12 @@ from sglang.srt.utils import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_dp_attention_enabled,
-    is_logging_enabled,
+    is_dp_attention_enabled
 )
 
 from sglang.srt.mem_cache.memory_pool import MFTokenToKVPool
 from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever
-from sglang.srt.mf_tool import quantize
+from sglang.srt.mf_tool import quantize, is_logging_enabled
 
 import logging
 logger = logging.getLogger(__name__)

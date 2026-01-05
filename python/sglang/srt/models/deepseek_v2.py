@@ -78,8 +78,7 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_dp_attention_enabled,
-    is_logging_enabled
+    is_dp_attention_enabled
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -163,7 +162,12 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
-from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, register_mf_tool
+from sglang.srt.mf_tool import (
+    MFSparseNbits,
+    TokenSparseRetriever,
+    register_mf_tool,
+    is_logging_enabled
+)
 from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
@@ -469,12 +473,12 @@ def handle_attention_triton(attn, forward_batch):
     # TODO: support prefill retrieve
     if "prefill_retrieve" in getattr(attn.attn_mha, "modes", []):
         return AttnForwardMethod.MLA
-    
+
     if forward_batch.forward_mode.is_decode():
         return AttnForwardMethod.MLA
     else:
         return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
-    
+
     if is_in_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
@@ -1470,7 +1474,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         # TODO: register moffett tool
         register_mf_tool(self.attn_mha, num_kv_heads=1)
         register_mf_tool(self.attn_mqa, num_kv_heads=1)
-        
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch,
     ) -> AttnForwardMethod:
@@ -1577,7 +1581,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-        
+
         if is_logging_enabled() and self.layer_id == 0:
             logger.debug(
                 f"<DeepseekV2AttentionMLA.forward_prepare> "
@@ -2805,7 +2809,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return self.forward_normal_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
-        
+
     def forward_normal_chunked_kv_prefill_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(
             q, k, v, forward_batch, save_kv_cache=False,
@@ -2816,7 +2820,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
-        
+
     def forward_normal_one_shot_prepare(
         self,
         positions: torch.Tensor,

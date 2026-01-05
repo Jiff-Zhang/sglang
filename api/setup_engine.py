@@ -6,7 +6,16 @@ except:
 import argparse
 from sglang.srt.server_args import ServerArgs
 import sglang as sgl
+import os
 import pickle
+
+os.environ["export GLOO_SOCKET_IFNAME"] = "eth0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
 
 
 def load_model(server_args: ServerArgs):
@@ -16,11 +25,11 @@ def load_model(server_args: ServerArgs):
 
 '''
     sampling_params = {
-        "temperature": 0.6,
-        "max_new_tokens": 20480,
-        "top_p": 1.0,
-        "top_k": -1,
-        "min_p": 0,
+        "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
         "n": 1,
     }
 
@@ -28,12 +37,36 @@ def load_model(server_args: ServerArgs):
 '''
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # ServerArgs.add_cli_args(parser)
-    # args = parser.parse_args()
-    # server_args = ServerArgs.from_cli_args(args)
-    # with open('/ssd01/workspace/sglang-n/exp/args.pkl', 'wb') as f:
-    #     pickle.dump(server_args, f)
-    with open('/ssd01/workspace/sglang-n/exp/args.pkl', 'rb') as f:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--temperature", "-t", type=float, default=0.1)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=-1)
+    parser.add_argument("--min_p", type=float, default=0.0)
+    parser.add_argument("--max_new_tokens", "-mt", type=int, default=128)
+    ServerArgs.add_cli_args(parser)
+    args = parser.parse_args()
+    args.model_path = os.path.realpath(args.model_path)
+        
+    sampling_params = {
+        "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "n": 1,
+    }
+
+    mf_dir = os.path.join(args.model_path, 'mf')
+    os.makedirs(mf_dir, exist_ok=True)
+    with open(os.path.join(mf_dir, 'sampling_params.pkl'), 'wb') as f:
+        pickle.dump(sampling_params, f)
+    with open(os.path.join(mf_dir, 'sampling_params.pkl'), 'rb') as f:
+        sampling_params = pickle.load(f)
+    
+    server_args = ServerArgs.from_cli_args(args)
+    with open(os.path.join(mf_dir, 'args.pkl'), 'wb') as f:
+        pickle.dump(server_args, f)
+    with open(os.path.join(mf_dir, 'args.pkl'), 'rb') as f:
         server_args = pickle.load(f)
+        
     load_model(server_args)

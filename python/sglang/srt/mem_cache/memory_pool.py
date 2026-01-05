@@ -57,8 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
-from sglang.srt.mf_tool import MFSparseNbits, quantize
-from sglang.srt.layers.dp_attention import is_logging_enabled
+from sglang.srt.mf_tool import MFSparseNbits, quantize, is_logging_enabled
 
 logger = logging.getLogger(__name__)
 
