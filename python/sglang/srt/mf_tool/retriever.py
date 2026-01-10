@@ -3,11 +3,13 @@ import torch
 import logging
 from einops import rearrange
 from typing import Optional, Tuple, List, Mapping, Dict, Callable
+from transformers import PretrainedConfig
 
 from sparseopt.attns.act_sparse_nbits import MFSparseNbits
 from sparseopt.attns.retriever import TokenSparseRetriever
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.logger import is_logging_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +33,16 @@ def quantize(
         dim=0
     )
 
-def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
-    return
-
+def register_mf_tool(
+    layer: RadixAttention,
+    config: PretrainedConfig,
+):
     assert isinstance(layer, RadixAttention), f"layer must be an instance of RadixAttention, got {type(layer)}"
-    assert num_kv_heads > 0, f"num_kv_heads must be > 0, got {num_kv_heads}"
     
     # return
+    
+    """
+    # TODO: Deprecated
     bank_size = 64
     modes = [
         # "prefill_quant",    # whether to quantize key/value/query/score when prefill
@@ -45,7 +50,6 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
         "prefill_retrieve", # whether to quantize cached key and retrieve tokens when prefill
         "retrieve",         # whether to quantize cached key and retrieve tokens when decode
     ]
-
     per_bank_tool = MFSparseNbits(
         bank_size=bank_size,
         sparsity=0.,
@@ -120,6 +124,32 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
         auto_reset=False,
         qk_scaling=layer.scaling, # TODO: unmark code for scaling
     )
+    """
+    
+    mf_config = getattr(config, "mf_config", {"modes": []})
+    modes = mf_config["modes"]
+
+    if len(modes) == 0:
+        return
+
+    supported_modes = {
+        "prefill_quant",
+        "cache_quant",
+        "prefill_retrieve",
+        "retrieve"
+    }
+    assert set(modes).issubset(supported_modes), \
+        f"unsupported modes: {modes}, supported modes: {supported_modes}"
+
+    q_tool = MFSparseNbits(**mf_config["q_tool"])
+    k_tool = MFSparseNbits(**mf_config["k_tool"])
+    v_tool = MFSparseNbits(**mf_config["v_tool"])
+    k_cache_tool = MFSparseNbits(**mf_config["k_cache_tool"])
+    v_cache_tool = MFSparseNbits(**mf_config["v_cache_tool"])
+    retriever = TokenSparseRetriever(
+        **mf_config["retriever"], qk_scaling=layer.scaling
+    )
+
     setattr(layer, "modes", modes)
     setattr(layer, "q_tool", q_tool)
     setattr(layer, "k_tool", k_tool)
@@ -127,7 +157,6 @@ def register_mf_tool(layer: RadixAttention, num_kv_heads: int):
     setattr(layer, "k_cache_tool", k_cache_tool)
     setattr(layer, "v_cache_tool", v_cache_tool)
     setattr(layer, "retriever", retriever)
-    setattr(layer, "num_kv_heads", num_kv_heads)
     if is_logging_enabled() and layer.layer_id == 0:
         logger.debug(
             f"<register_mf_tool> \n"

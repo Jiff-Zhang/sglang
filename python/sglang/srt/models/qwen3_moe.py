@@ -359,9 +359,6 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
-        
-        # TODO: register moffett tool
-        register_mf_tool(self.attn, num_kv_heads=self.num_kv_heads)
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -493,6 +490,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
         )
+        
+        # TODO: register moffett tool
+        register_mf_tool(self.self_attn.attn, config=config)
 
         self.layer_id = layer_id
 

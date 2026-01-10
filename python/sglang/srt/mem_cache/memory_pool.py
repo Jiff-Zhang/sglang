@@ -879,6 +879,7 @@ class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
@@ -892,6 +893,7 @@ class MFMHATokenToKVPool(MHATokenToKVPool, MFTokenToKVPool):
             enable_memory_saver=enable_memory_saver,
             start_layer=start_layer,
             end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy
         )
         

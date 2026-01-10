@@ -66,9 +66,11 @@ class ModelSaver:
         num_layers = config["num_hidden_layers"]
         self.moe_layers = [
             i for i in range(
-                config["first_k_dense_replace"],
+                # config["first_k_dense_replace"],
+                config.get("first_k_dense_replace", 0),
                 num_layers,
-                config["moe_layer_freq"]
+                # config["moe_layer_freq"]
+                config.get("moe_layer_freq", 1)
             )
         ]
         self.normal_layers = [i for i in range(num_layers)]
@@ -144,7 +146,6 @@ def run(
         for key in sparsity
     }
     weights, weight_map, weight_map_ref = load_weights(in_weight_dir)
-    w_block = [128, 128]
 
     if partial_save:
         with open(os.path.join(in_weight_dir, "config.json"), "r") as fid:
@@ -165,19 +166,40 @@ def run(
         saver = None
     ori_weight_map = weight_map
 
+    layers = [
+        "gate_proj", "up_proj", "down_proj",
+        "k_proj", "v_proj", "q_proj", "o_proj",
+        "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"
+    ]
     for layer_idx, weight_map in weight_map_dict.items():
         for name in tqdm(list(weight_map.keys())[:], desc="Processing weights"):
-            if name.endswith(".weight_scale_inv"):
-                s_name = name
-                w_name = name.replace(".weight_scale_inv", ".weight")
-                
-                scale = get_tensor(weights, weight_map, s_name)
+            w_block = [128, 128]
+            if any(l in name for l in layers):
+                w_name = name
+                s_name = name.replace(".weight", ".weight_scale_inv")
                 weight = get_tensor(weights, weight_map, w_name)
+                has_scale = s_name in weight_map
+                if has_scale:
+                    assert weight.dtype not in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                    scale = get_tensor(weights, weight_map, s_name)
+                    scale = scale.repeat_interleave(w_block[0], dim=0)
+                    scale = scale.repeat_interleave(w_block[1], dim=1)
+                    weight = weight.to(scale.dtype) * \
+                        scale[:weight.size(0), :weight.size(1)]
+                else:
+                    assert weight.dtype in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                    
+            # if name.endswith(".weight_scale_inv"):
+            #     s_name = name
+            #     w_name = name.replace(".weight_scale_inv", ".weight")
                 
-                scale = scale.repeat_interleave(w_block[0], dim=0)
-                scale = scale.repeat_interleave(w_block[1], dim=1)
-                weight = weight.to(scale.dtype) * \
-                    scale[:weight.size(0), :weight.size(1)]
+            #     scale = get_tensor(weights, weight_map, s_name)
+            #     weight = get_tensor(weights, weight_map, w_name)
+                
+            #     scale = scale.repeat_interleave(w_block[0], dim=0)
+            #     scale = scale.repeat_interleave(w_block[1], dim=1)
+            #     weight = weight.to(scale.dtype) * \
+            #         scale[:weight.size(0), :weight.size(1)]
 
                 ori_weight = weight
 
@@ -253,8 +275,21 @@ def run(
                 )
 
                 # update weights
-                set_tensor(weights, weight_map, weight_map_ref, s_name, hscale.to(scale_dtype))
-                set_tensor(weights, weight_map, weight_map_ref, w_name, weight.to(torch.int8))
+                set_tensor(
+                    weights,
+                    weight_map,
+                    weight_map_ref,
+                    s_name,
+                    hscale.to(scale_dtype),
+                    key=s_name if has_scale else w_name
+                )
+                set_tensor(
+                    weights,
+                    weight_map,
+                    weight_map_ref,
+                    w_name,
+                    weight.to(torch.int8)
+                )
                 if mf_tool.sparsity > 0 and mf_tool.dtypes["low"] != "zero":
                     set_tensor(
                         weights,
@@ -379,11 +414,16 @@ if __name__ == "__main__":
     # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Int8"
     # out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-W8xH8L3"
     out_weight_dir = "/ssd01/models/DeepSeek-V3.2-Exp-MF-Linear_WInt8-MOE_W8xH8L3"
+
+    in_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507"
+    out_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507-MF-Int8"
+    out_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
     sparsity = {
         "linear": 0,
         # "linear": 0.875,
+        # "experts": 0,
         "experts": 0.875 
     }
     bank_size = 64

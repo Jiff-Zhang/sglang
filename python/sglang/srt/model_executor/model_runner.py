@@ -271,8 +271,9 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # TODO: Whether to use Moffett tool, temporarily active when using MLATokenToKVPool
-        self.is_moffett = False
-        # self.is_moffett = True
+        self.is_mf_cache = "retrieve" in getattr(
+            model_config.hf_config, "mf_config", {"modes": []}
+        )["modes"]
         
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -1363,7 +1364,7 @@ class ModelRunner:
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
-            if self.is_moffett:
+            if self.is_mf_cache:
                 cell_size *= 2
         else:
             cell_size = (
@@ -1389,7 +1390,7 @@ class ModelRunner:
                     )
                     // scale_block_size
                 )
-            if self.is_moffett:
+            if self.is_mf_cache:
                 cell_size *= 1.5
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
@@ -1828,7 +1829,7 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
             else:
-                if self.is_moffett:
+                if self.is_mf_cache:
                     MLATokenToKVPoolClass = MFMLATokenToKVPool
                 else:
                     MLATokenToKVPoolClass = MLATokenToKVPool
@@ -1920,7 +1921,7 @@ class ModelRunner:
                         ),
                     )
                 else:
-                    if self.is_moffett:
+                    if self.is_mf_cache:
                         MHATokenToKVPoolClass = MFMHATokenToKVPool
                     else:
                         MHATokenToKVPoolClass = MHATokenToKVPool

@@ -1471,10 +1471,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "MLA Preprocess only works with Unquant or W8A8Int8"
             self.mla_preprocess = None
 
-        # TODO: register moffett tool
-        register_mf_tool(self.attn_mha, num_kv_heads=1)
-        register_mf_tool(self.attn_mqa, num_kv_heads=1)
-
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch,
     ) -> AttnForwardMethod:
@@ -3019,6 +3015,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
+
+        # TODO: register moffett tool
+        register_mf_tool(self.self_attn.attn_mha, config=config)
+        register_mf_tool(self.self_attn.attn_mqa, config=config)
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)

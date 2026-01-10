@@ -1397,9 +1397,7 @@ class TritonAttnBackend(AttentionBackend):
         ), f"token_to_kv_pool must be MFTokenToKVPool"
         assert hasattr(layer, "retriever"), \
             f"layer {layer.layer_id} does not have retriever"
-        assert hasattr(layer, "num_kv_heads"), \
-            f"layer {layer.layer_id} does not have num_kv_heads"
-        num_kv_heads = layer.num_kv_heads
+        num_kv_head = k_cache.size(1)
 
         time_stamp = time.time()
         retriever: TokenSparseRetriever = layer.retriever
@@ -1423,13 +1421,13 @@ class TritonAttnBackend(AttentionBackend):
             # if True:
             if not batch:
                 kv_indices_n = list()
-                # for num_kv_heads > 1
+                # for num_kv_head > 1
                 k_cache_n = list()
                 v_cache_n = list()
                 cum_len = 0
                 for i in range(q_reverted.size(0)):
                     retriever._reset()
-                    if num_kv_heads == 1:
+                    if num_kv_head == 1:
                         # [L_k, H_k, D] -> [1, L_k, H_k, D] -> [1, H_k, L_k, D]
                         label_cache_cur = label_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
                         # Don't use update because it involves sparse and quantize
@@ -1443,7 +1441,8 @@ class TritonAttnBackend(AttentionBackend):
                         assert idx.min() >= 0, "idx should be non-negative"
                         kv_indice = kv_indices[idx + kv_indptr[i]]
                     else:
-                        assert get_attention_tp_size() == 1, f"Only support one gpu mode, but get {get_attention_tp_size()}"
+                        assert get_attention_tp_size() == 1, \
+                            f"Only support one gpu mode, but get {get_attention_tp_size()}"
                         # TODO: fix for MHA, only support one gpu mode
                         # [L_k, H_k, D] -> [1, L_k, H_k, D] -> [1, H_k, L_k, D]
                         k_cache_cur = k_cache[kv_indices[kv_indptr[i]: kv_indptr[i+1]]][None, ...].transpose(1, 2)
@@ -1456,13 +1455,14 @@ class TritonAttnBackend(AttentionBackend):
                         k_cache_cur, v_cache_cur, _ = retriever.fetch_kv(
                             q_reverted[i: i+1],
                             k_cache_cur,
-                            v_cache_cur
+                            v_cache_cur,
+                            causal_mask=None
                         )
                         # [1, H_k, L_k, D] -> [1, L_k, H_k, D] -> [L_k, H_k, D]
                         k_cache_n.append(k_cache_cur.transpose(1, 2)[0])
                         v_cache_n.append(v_cache_cur.transpose(1, 2)[0])
                         kv_indice = torch.arange(
-                            k_cache_cur.size(1),
+                            k_cache_cur.size(2),
                             device=kv_indices.device,
                             dtype=kv_indices.dtype
                         ) + cum_len
@@ -1472,7 +1472,7 @@ class TritonAttnBackend(AttentionBackend):
                 
             # TODO: Deprecated
             else:
-                assert num_kv_heads == 1, f"Batch mode only support num_kv_heads == 1"
+                assert num_kv_head == 1, f"Batch mode only support num_kv_head == 1"
                 
                 # [MB, H_q, 1, D]
                 select_q_reverted = q_reverted[seq_idx]
@@ -1529,7 +1529,7 @@ class TritonAttnBackend(AttentionBackend):
             # merge kv_indices
             kv_indices_n = torch.cat(kv_indices_n, dim=-1)
 
-            if num_kv_heads == 1:
+            if num_kv_head == 1:
                 k_cache_n = k_cache
                 v_cache_n = v_cache
             else:
