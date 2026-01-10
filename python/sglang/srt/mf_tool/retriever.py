@@ -33,6 +33,7 @@ def quantize(
         dim=0
     )
 
+default_mf_config = {"modes": [], "active": False}
 def register_mf_tool(
     layer: RadixAttention,
     config: PretrainedConfig,
@@ -126,10 +127,8 @@ def register_mf_tool(
     )
     """
     
-    mf_config = getattr(config, "mf_config", {"modes": []})
-    modes = mf_config["modes"]
-
-    if len(modes) == 0:
+    mf_config = getattr(config, "mf_config", default_mf_config)
+    if not mf_config["active"]:
         return
 
     supported_modes = {
@@ -138,6 +137,7 @@ def register_mf_tool(
         "prefill_retrieve",
         "retrieve"
     }
+    modes = mf_config["modes"]
     assert set(modes).issubset(supported_modes), \
         f"unsupported modes: {modes}, supported modes: {supported_modes}"
 
