@@ -276,7 +276,10 @@ class ModelRunner:
             model_config.hf_config, "mf_config", default_mf_config
         )
         self.use_mf_cache = (
-            mf_config["active"] and "retrieve" in mf_config["modes"]
+            mf_config["active"] and (
+                "retrieve" in mf_config["modes"] or 
+                "cache_quant" in mf_config["modes"]
+            )
         )
         
         # Parse args
