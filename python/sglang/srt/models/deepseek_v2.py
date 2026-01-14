@@ -2629,6 +2629,12 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        mf_save(
+            hidden_states,
+            name='model_norm',
+            layer_id=None,
+            gather=False,
+        )
         return hidden_states
 
 
