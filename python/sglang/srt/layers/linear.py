@@ -154,6 +154,8 @@ class LinearBase(torch.nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        # name
+        self.name = prefix
 
         # Keep input parameters
         self.input_size = input_size
@@ -325,7 +327,6 @@ class ColumnParallelLinear(LinearBase):
 
         if output_sizes is None:
             output_sizes = [output_size]
-
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size,

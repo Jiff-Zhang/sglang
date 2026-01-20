@@ -516,13 +516,39 @@ def run(
 
     model.config.quantization_config = {
         "activation_scheme": "dynamic",
-        "mf_format": True,
         "quant_method": "blockwise_int8",
-        "smooth": smooth,
-        "w_sparsity": sparsity,
-        "w_low_bits": low_bits,
-        # "mask_in_id": mask_in_id and sparsity > 0,
-        "mask_in_id": mask_in_id,
+        "mf_linear_config": {
+            "__default__": {
+                "weight": {
+                    "sparsity": sparsity["linear"],
+                    "high_bits": 8,
+                    "low_bits": low_bits,
+                    "mask_in_id": True
+                },
+                "input": {
+                    "sparsity": 0,
+                    "high_bits": 8,
+                    "low_bits": 0,
+                    "mf_format": True
+                },
+                "smooth": smooth
+            },
+            ".*experts": {
+                "weight": {
+                    "sparsity": sparsity["experts"],
+                    "high_bits": 8,
+                    "low_bits": low_bits,
+                    "mask_in_id": True
+                },
+                "input": {
+                    "sparsity": 0,
+                    "high_bits": 8,
+                    "low_bits": 0,
+                    "mf_format": True
+                },
+                "smooth": smooth
+            }
+        },
         "weight_block_size": [
             1,
             64

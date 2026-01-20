@@ -11,4 +11,6 @@ from .fp32_to_fp24 import fp32_rne_to_fp24_torch, fp32_trunc_to_fp24_torch
 # fp32_to_fp24 = fp32_rne_to_fp24_torch
 fp32_to_fp24 = lambda x: x
 
+from .match import match_dict
+
 from sglang.srt.logger import is_logging_enabled

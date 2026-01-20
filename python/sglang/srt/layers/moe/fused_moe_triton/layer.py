@@ -151,6 +151,9 @@ class FusedMoE(torch.nn.Module):
         is_gated: bool = True,
     ):
         super().__init__()
+        # name
+        self.name = prefix
+        
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 

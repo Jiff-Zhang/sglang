@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_line
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
-from sglang.srt.mf_tool import generate_mask
+from sglang.srt.mf_tool import generate_mask, match_dict
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -35,6 +35,23 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
+default_mf_config: Dict[str, Any] = {
+    "__default__": {
+        "weight": {
+            "sparsity": 0.0,
+            "high_bits": 8,
+            "low_bits": 0,
+            "mask_in_id": False,
+        },
+        "input": {
+            "sparsity": 0.0,
+            "high_bits": 8,
+            "low_bits": 0,
+            "mf_format": False
+        },
+        "smooth": False
+    }
+}
 
 class BlockInt8Config(QuantizationConfig):
     """Config class for INT8."""
@@ -45,10 +62,7 @@ class BlockInt8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
-        smooth: bool = False,
-        mf_format: bool = False,
-        w_sparsity: float = 0.0,
-        mask_in_id: bool = False
+        mf_config: Dict[str, Any] = None,
     ) -> None:
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         if is_checkpoint_int8_serialized:
@@ -74,10 +88,7 @@ class BlockInt8Config(QuantizationConfig):
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
-        self.smooth = smooth
-        self.mf_format = mf_format
-        self.w_sparsity = w_sparsity
-        self.mask_in_id = mask_in_id
+        self.mf_config = mf_config
 
     @classmethod
     def get_name(cls) -> str:
@@ -102,24 +113,13 @@ class BlockInt8Config(QuantizationConfig):
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        smooth = cls.get_from_keys_or(config, ["smooth"], False)
-        mf_format = cls.get_from_keys_or(config, ["mf_format"], False)
-        w_sparsity = cls.get_from_keys_or(config, ["w_sparsity"], 0.0)
-        mask_in_id = cls.get_from_keys_or(config, ["mask_in_id"], False)
-        if not isinstance(w_sparsity, dict):
-            w_sparsity = {
-                "linear": w_sparsity,
-                "experts": w_sparsity
-            }
+        mf_config = cls.get_from_keys_or(config, ["mf_linear_config"], default_mf_config)
         return cls(
             is_checkpoint_int8_serialized=is_checkpoint_int8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
-            smooth=smooth,
-            mf_format=mf_format,
-            w_sparsity=w_sparsity,
-            mask_in_id=mask_in_id
+            mf_config=mf_config
         )
 
     def get_quant_method(
@@ -157,6 +157,14 @@ class BlockInt8LinearMethod(LinearMethodBase):
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
 
+    @property
+    def with_low_bits(self):
+        assert hasattr(self, "mf_config")
+        return (
+            self.mf_config["weight"]["sparsity"] > 0 and \
+            self.mf_config["weight"]["low_bits"] > 0
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -167,6 +175,14 @@ class BlockInt8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        self.mf_config = match_dict(
+            self.quant_config.mf_config,
+            layer.name,
+            default=self.quant_config.mf_config["__default__"]
+        )
+        assert self.mf_config['input']['sparsity'] == 0, \
+            f"Input sparsity must be 0, but got {self.mf_config['input']['sparsity']}."
+        
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -210,7 +226,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         )
         scale_dtype = (
             torch.bfloat16
-            if self.quant_config.mf_format
+            if self.mf_config["input"]["mf_format"]
             else torch.float32
         )
 
@@ -239,7 +255,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale_inv", scale)
 
         # low bits part
-        if self.quant_config.w_sparsity["linear"] > 0:
+        if self.with_low_bits:
             # WEIGHT SCALE
             lscale = BlockQuantScaleParameter(
                 data=torch.empty(
@@ -254,14 +270,14 @@ class BlockInt8LinearMethod(LinearMethodBase):
             lscale[:] = torch.finfo(scale_dtype).min
             layer.register_parameter("weight_lscale_inv", lscale)
             # MASK
-            if self.quant_config.mask_in_id:
+            if self.mf_config["weight"]["mask_in_id"]:
                 # mask_id = _ColumnvLLMParameter(
                 #     data=torch.empty(
                 #         output_size_per_partition,
                 #         (input_size_per_partition + block_k - 1) // block_k,
                 #         int(
                 #             self.quant_config.weight_block_size[1] * \
-                #                 (1 - self.quant_config.w_sparsity["linear"])
+                #                 (1 - self.mf_config["weight"]["sparsity"])
                 #         ),
                 #         dtype=torch.int8
                 #     ),
@@ -275,7 +291,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                         int(
                             self.quant_config.weight_block_size[1] * \
                                 self.quant_config.weight_block_size[0] * \
-                                (1 - self.quant_config.w_sparsity["linear"])
+                                (1 - self.mf_config["weight"]["sparsity"])
                         ),
                         dtype=torch.int8
                     ),
@@ -303,7 +319,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         layer.register_parameter("input_scale", None)
 
         # SMOOTH SCALE
-        if self.quant_config.smooth:
+        if self.mf_config["smooth"]:
             smooth_scale = RowvLLMParameter(
                 data=torch.ones(
                     1,
@@ -332,10 +348,10 @@ class BlockInt8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.quant_config.smooth:
+        if self.mf_config["smooth"]:
             x = x / layer.smooth_scale
 
-        if self.quant_config.w_sparsity["linear"] > 0 and self.quant_config.mask_in_id:
+        if self.with_low_bits and self.mf_config["weight"]["mask_in_id"]:
             mask = generate_mask(
                 layer.mask_id,
                 self.quant_config.weight_block_size,
@@ -351,10 +367,10 @@ class BlockInt8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale_inv,
             input_scale=None,
             bias=bias,
-            mf_format=self.quant_config.mf_format
+            mf_format=self.mf_config["input"]["mf_format"]
         )
 
-        if self.quant_config.w_sparsity["linear"] > 0:
+        if self.with_low_bits:
             output += apply_w8a8_block_int8_linear(
                 input=x,
                 weight=layer.weight * (1 - mask),
@@ -362,7 +378,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_lscale_inv,
                 input_scale=None,
                 bias=bias,
-                mf_format=self.quant_config.mf_format
+                mf_format=self.mf_config["input"]["mf_format"]
             )
         return output
 
@@ -382,6 +398,14 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
+        
+    @property
+    def with_low_bits(self):
+        assert hasattr(self, "mf_config")
+        return (
+            self.mf_config["weight"]["sparsity"] > 0 and \
+            self.mf_config["weight"]["low_bits"] > 0
+        )
 
     def create_weights(
         self,
@@ -393,12 +417,20 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+        
+        self.mf_config = match_dict(
+            self.quant_config.mf_config,
+            layer.name,
+            default=self.quant_config.mf_config["__default__"]
+        )
+        assert self.mf_config['input']['sparsity'] == 0, \
+            f"Input sparsity must be 0, but got {self.mf_config['input']['sparsity']}."
 
         if self.quant_config.is_checkpoint_int8_serialized:
             params_dtype = torch.int8
         scale_dtype = (
             torch.bfloat16
-            if self.quant_config.mf_format
+            if self.mf_config["input"]["mf_format"]
             else torch.float32
         )
         tp_size = get_tensor_model_parallel_world_size()
@@ -450,9 +482,9 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
         
         # low bits part
-        if self.quant_config.w_sparsity["experts"] > 0:
+        if self.with_low_bits:
             # MASK
-            if self.quant_config.mask_in_id:
+            if self.mf_config["weight"]["mask_in_id"]:
                 w13_mask_id = torch.nn.Parameter(
                     torch.empty(
                         num_experts,
@@ -461,7 +493,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                         int(
                             self.quant_config.weight_block_size[1] * \
                                 self.quant_config.weight_block_size[0] * \
-                                (1 - self.quant_config.w_sparsity["experts"])
+                                (1 - self.mf_config["weight"]["sparsity"])
                         ),
                         dtype=torch.int8,
                     ),
@@ -477,7 +509,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
                         int(
                             self.quant_config.weight_block_size[1] * \
                                 self.quant_config.weight_block_size[0] * \
-                                (1 - self.quant_config.w_sparsity["experts"])
+                                (1 - self.mf_config["weight"]["sparsity"])
                         ),
                         dtype=torch.int8,
                     ),
@@ -542,7 +574,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # low bits part
-        if self.quant_config.w_sparsity["experts"] > 0:
+        if self.with_low_bits:
             # WEIGHT_SCALES
             w13_weight_lscale = torch.nn.Parameter(
                 torch.ones(
@@ -577,7 +609,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         # SMOOTH SCALE
         # TODO: to be fixed
-        if self.quant_config.smooth:
+        if self.mf_config["smooth"]:
             w13_smooth_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -621,7 +653,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        if self.quant_config.w_sparsity["experts"] > 0 and self.quant_config.mask_in_id:
+        if self.with_low_bits and self.mf_config["weight"]["mask_in_id"]:
             w13_mask = generate_mask(
                 rearrange(layer.w13_mask_id, "E O (G I) N -> (E G O) I N", G=2),
                 self.quant_config.weight_block_size,
@@ -645,7 +677,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w13_mask = layer.w13_mask
             w2_mask = layer.w2_mask
 
-        if self.quant_config.smooth:
+        if self.mf_config["smooth"]:
             assert torch.allclose(
                 layer.w13_smooth_scale[:, 0], layer.w13_smooth_scale[:, 1]
             ), f"Find mismatch cases between gate_proj and up_proj within each expert."
@@ -665,7 +697,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale_inv,
             w13_lscale=layer.w13_weight_lscale_inv, # moffett
             w2_lscale=layer.w2_weight_lscale_inv, # moffett
-            mf_format=self.quant_config.mf_format, # moffett
+            mf_format=self.mf_config["input"]["mf_format"], # moffett
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             a13_smooth_scale=w13_smooth_scale, # moffett
