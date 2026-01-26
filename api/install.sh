@@ -9,4 +9,5 @@
 # Last Modified: Year-month-day
 # ***********************************************
 
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+# pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+pip install colorama matplotlib
