@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 import json
 import os
-import glob
+import glob, re
 
 from collections import defaultdict
 from tqdm import tqdm
@@ -121,29 +121,26 @@ class ModelSaver:
 def run(
     in_weight_dir: str,
     out_weight_dir: str,
-    sparsity: Dict[str, float],
-    high_bits: int,
-    low_bits: int,
     bank_size: int,
-    mask_in_id: bool=True,
+    mf_linear_config: Dict[str, float],
+    layers: List[str],
     partial_save: bool=False
 ):
-    dtypes = {
-        "high": "none" if high_bits == 16 else f"int{high_bits}",
-        "low": "zero" if low_bits == 0 else f"int{low_bits}"
-    }
     mf_tools = {
         key: MFSparseNbits(
-            sparsity = sparsity[key],
+            sparsity=config["weight"]["sparsity"],
             bank_size=bank_size,
             sparse_mode="per_bank",
             quant_mode="per_bank",
-            dtypes=dtypes,
+            dtypes={
+                "high": "none" if config["weight"]["high_bits"] == 16 else f"int{config['weight']['high_bits']}",
+                "low": "zero" if config["weight"]["low_bits"] == 0 else f"int{config['weight']['low_bits']}"
+            },
             quant_symmetric=True,
             quant_masked=True,
             hardware=True
         )
-        for key in sparsity
+        for key, config in mf_linear_config.items()
     }
     weights, weight_map, weight_map_ref = load_weights(in_weight_dir)
 
@@ -166,14 +163,16 @@ def run(
         saver = None
     ori_weight_map = weight_map
 
-    layers = [
-        "gate_proj", "up_proj", "down_proj",
-        "k_proj", "v_proj", "q_proj", "o_proj",
-        "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"
-    ]
+    with open(os.path.join(in_weight_dir, "config.json"), "r") as fid:
+        model_config = json.load(fid)
+        if "quantization_config" in model_config:
+            w_block = model_config["quantization_config"]["weight_block_size"]
+        else:
+            w_block = None
     for layer_idx, weight_map in weight_map_dict.items():
         for name in tqdm(list(weight_map.keys())[:], desc="Processing weights"):
-            w_block = [128, 128]
+            if not name.endswith("weight"):
+                continue
             if any(l in name for l in layers):
                 w_name = name
                 s_name = name.replace(".weight", ".weight_scale_inv")
@@ -188,6 +187,7 @@ def run(
                         scale[:weight.size(0), :weight.size(1)]
                 else:
                     assert weight.dtype in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                tqdm.write(f"### {w_name} with shape {list(weight.shape)} ###")
                     
             # if name.endswith(".weight_scale_inv"):
             #     s_name = name
@@ -200,12 +200,11 @@ def run(
             #     scale = scale.repeat_interleave(w_block[1], dim=1)
             #     weight = weight.to(scale.dtype) * \
             #         scale[:weight.size(0), :weight.size(1)]
-
                 ori_weight = weight
 
-                mf_tool = mf_tools["linear"]
+                mf_tool = mf_tools["__default__"]
                 for k in mf_tools:
-                    if k in name:
+                    if re.search(k, w_name):
                         mf_tool = mf_tools[k]
                         break
                 
@@ -271,7 +270,7 @@ def run(
                 # new_value = new_weight[index]
                 tqdm.write(
                     # f"{w_name}: {value.item(), ori_value.item(), new_value.item()}"
-                    f"### {w_name} ###\n\tdiff mean: {diff.mean().item():.5f}\tdiff max: {diff.max().item():.5f}"
+                    f"\tdiff mean: {diff.mean().item():.5f}\tdiff max: {diff.max().item():.5f}"
                 )
 
                 # update weights
@@ -338,10 +337,8 @@ def run(
         in_weight_dir,
         out_weight_dir,
         weight_map,
-        sparsity,
-        low_bits,
+        mf_linear_config,
         bank_size,
-        mask_in_id
     )
 
 def save_weights(weights, out_weight_dir):
@@ -353,7 +350,7 @@ def save_weights(weights, out_weight_dir):
 
 def save_extra(
     in_weight_dir, out_weight_dir, weight_map, 
-    sparsity, low_bits, bank_size, mask_in_id
+    mf_linear_config, bank_size
 ):
     file_list = [
         "configuration.json",
@@ -366,6 +363,7 @@ def save_extra(
         "config.json",
         "model.safetensors.index.json"
     ]
+    smooth = False
     for filepath in file_list:
         if os.path.exists(os.path.join(in_weight_dir, filepath)):
             if filepath == "config.json":
@@ -375,38 +373,7 @@ def save_extra(
                     info["quantization_config"] = {
                         "activation_scheme": "dynamic",
                         "quant_method": "blockwise_int8",
-                        "mf_linear_config": {
-                            "__default__": {
-                                "weight": {
-                                    "sparsity": sparsity["linear"],
-                                    "high_bits": 8,
-                                    "low_bits": low_bits,
-                                    "mask_in_id": True
-                                },
-                                "input": {
-                                    "sparsity": 0,
-                                    "high_bits": 8,
-                                    "low_bits": 0,
-                                    "mf_format": True
-                                },
-                                "smooth": smooth
-                            },
-                            ".*experts": {
-                                "weight": {
-                                    "sparsity": sparsity["experts"],
-                                    "high_bits": 8,
-                                    "low_bits": low_bits,
-                                    "mask_in_id": True
-                                },
-                                "input": {
-                                    "sparsity": 0,
-                                    "high_bits": 8,
-                                    "low_bits": 0,
-                                    "mf_format": True
-                                },
-                                "smooth": smooth
-                            }
-                        },
+                        "mf_linear_config": mf_linear_config,
                         "weight_block_size": [
                             1,
                             bank_size
@@ -445,14 +412,12 @@ if __name__ == "__main__":
     in_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507"
     out_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507-MF-Int8"
     out_weight_dir = "/ssd01/models/Qwen3-235B-A22B-Instruct-2507-MF-Linear_WInt8-MOE_W8xH8L3"
+
+    in_weight_dir = "/ssd01/models/MiniMax-M2.1"
+    out_weight_dir = "/ssd01/models/MiniMax-M2.1-MF-Int8"
+    # out_weight_dir = "/ssd01/models/MiniMax-M2.1-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
-    sparsity = {
-        "linear": 0,
-        # "linear": 0.875,
-        # "experts": 0,
-        "experts": 0.875 
-    }
     bank_size = 64
     high_bits = 8
     low_bits = 3
@@ -460,14 +425,51 @@ if __name__ == "__main__":
     mask_in_id = True
     partial_save = False
     partial_save = True
+    smooth = False
+    mf_linear_config = {
+        "__default__": {
+            "weight": {
+                "sparsity": 0,
+                "high_bits": high_bits,
+                "low_bits": low_bits,
+                "mask_in_id": mask_in_id
+            },
+            "input": {
+                "sparsity": 0,
+                "high_bits": high_bits,
+                "low_bits": 0,
+                "mf_format": True
+            },
+            "smooth": smooth
+        },
+        # ".*experts": {
+        #     "weight": {
+        #         "sparsity": 0.875,
+        #         "high_bits": high_bits,
+        #         "low_bits": low_bits,
+        #         "mask_in_id": True
+        #     },
+        #     "input": {
+        #         "sparsity": 0,
+        #         "high_bits": high_bits,
+        #         "low_bits": 0,
+        #         "mf_format": True
+        #     },
+        #     "smooth": smooth
+        # }
+    }
+    layers = [
+        "gate_proj", "up_proj", "down_proj",
+        "k_proj", "v_proj", "q_proj", "o_proj",
+        "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+        "w1", "w3", # MiniMax-M2.1
+    ]
     
     run(
         in_weight_dir,
         out_weight_dir,
-        sparsity=sparsity,
-        high_bits=high_bits,
-        low_bits=low_bits,
         bank_size=bank_size,
-        mask_in_id=mask_in_id,
+        mf_linear_config=mf_linear_config,
+        layers=layers,
         partial_save=partial_save
     )
