@@ -157,8 +157,8 @@ def register_mf_tool(
     setattr(layer, "k_cache_tool", k_cache_tool)
     setattr(layer, "v_cache_tool", v_cache_tool)
     setattr(layer, "retriever", retriever)
-    if is_logging_enabled() and layer.layer_id == 0:
-        logger.debug(
+    if is_logging_enabled():
+        logger.debug_once(
             f"<register_mf_tool> \n"
             f"\t#modes: {modes}\n"
             f"\t#retriever: {retriever.stats_str}\n"

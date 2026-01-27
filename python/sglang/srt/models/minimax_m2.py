@@ -71,6 +71,11 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     make_layers,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled
+)
 
 logger = logging.getLogger(__name__)
 

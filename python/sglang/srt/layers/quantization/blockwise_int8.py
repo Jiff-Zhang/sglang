@@ -706,5 +706,4 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         )
 
         output = self.runner.run(dispatch_output, quant_info)
-        
         return output

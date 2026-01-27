@@ -356,6 +356,10 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    if input_2d.numel() == 0:
+        return torch.zeros(
+            *output_shape, dtype=input_2d.dtype, device=input_2d.device
+        )
 
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True

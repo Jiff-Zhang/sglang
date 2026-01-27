@@ -348,6 +348,9 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if query.numel() == 0 and key.numel() == 0:
+            return query, key
+
         if not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,

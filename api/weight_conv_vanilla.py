@@ -355,13 +355,15 @@ def save_extra(
     file_list = [
         "configuration.json",
         "configuration_deepseek.py",
+        "configuration_minimax_m2.py",
         "generation_config.json",
         "tokenizer_config.json",
         "tokenizer.json",
         "modeling_deepseek.py",
+        "modeling_minimax_m2.py",
         "inference",
         "config.json",
-        "model.safetensors.index.json"
+        "model.safetensors.index.json",
     ]
     smooth = False
     for filepath in file_list:
@@ -462,7 +464,7 @@ if __name__ == "__main__":
         "gate_proj", "up_proj", "down_proj",
         "k_proj", "v_proj", "q_proj", "o_proj",
         "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
-        "w1", "w3", # MiniMax-M2.1
+        "w1", "w2", "w3", # MiniMax-M2.1
     ]
     
     run(
