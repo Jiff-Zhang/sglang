@@ -115,7 +115,7 @@ class ModelRunnerKVCacheMixin:
 
             # moffett
             if self.use_mf_cache:
-                cell_size *= 1.5
+                cell_size = int(cell_size * 1.5)
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):

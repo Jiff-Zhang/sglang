@@ -314,6 +314,42 @@ class DeepseekMHAForwardMixin:
         return self.forward_normal_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
+
+    def mla2mha_cache(self, latent_cache: torch.Tensor):
+        if latent_cache.size(0) == 0:
+            return torch.empty(
+                (0, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=latent_cache.dtype,
+                device=latent_cache.device,
+            ), torch.empty(
+                (0, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=latent_cache.dtype,
+                device=latent_cache.device,
+            )
+            
+        kv_a_normed, k_pe = latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_a_normed = kv_a_normed.squeeze(1).contiguous()
+        kv = self.kv_b_proj(kv_a_normed)[0]
+        kv = kv.view(
+            -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        v = kv[..., self.qk_nope_head_dim :]
+        k_nope = kv[..., : self.qk_nope_head_dim]
+
+        k = torch.empty(
+            (
+                k_nope.shape[0],
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+            ),
+            dtype=v.dtype,
+            device=v.device,
+        )
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        return k, v
         
     def forward_normal_chunked_kv_prefill_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(
