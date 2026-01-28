@@ -28,7 +28,8 @@ def apply_w8a8_block_int8_linear(
             mode="per_bank",
             dtype="int8",
             bank_size=block_size[1],
-            symmetric=True
+            symmetric=True,
+            hardware=True
         )
         input_2d_n = tool.transform.preprocess(input_2d)
         q_input, x_scale = tool.sym_quant(input_2d_n)
