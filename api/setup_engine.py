@@ -80,4 +80,4 @@ if __name__ == "__main__":
         server_args = pickle.load(f)
 
     model = load_model(server_args)
-    talk(model)
+    talk(model, sampling_params)

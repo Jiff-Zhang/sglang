@@ -63,13 +63,21 @@ def query_llm(prompts, model_name, model, tokenizer, client=None, temperature=0.
         #     for prompt in tqdm(prompts, desc="Apply template")
         # ]
 
+    # sampling_params = {
+    #     "temperature": args.temperature,
+    #     "max_new_tokens": args.max_new_tokens,
+    #     # "max_new_tokens": 10,
+    #     "stop": stop,
+    #     # "top_p": args.top_p,
+    #     # "top_k": args.top_k,
+    #     "n": 1,
+    # }
     sampling_params = {
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
-        # "max_new_tokens": 10,
-        "stop": stop,
-        # "top_p": args.top_p,
-        # "top_k": args.top_k,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
         "n": 1,
     }
 
@@ -100,6 +108,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", "-m", type=str, default="GLM-4-9B-Chat")
     parser.add_argument("--temperature", "-t", type=float, default=0.1)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=-1)
+    parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--max_new_tokens", "-mt", type=int, default=128)
     parser.add_argument("--apply_template", action='store_true')
     ServerArgs.add_cli_args(parser)
