@@ -36,6 +36,16 @@ def load_model(server_args: ServerArgs):
     outputs = model.generate(prompts, sampling_params)
 '''
 
+def talk(model):
+    prompt = input("User >> ")
+    while prompt != "[exit]":
+        prompts = [prompt]
+        outputs = model.generate(prompts, sampling_params)
+        responses = [output['text'].strip() for output in outputs]
+        response = responses[0]
+        print(f"Assistant >> {response}")
+        prompt = input("User >> ")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--temperature", "-t", type=float, default=0.1)
@@ -46,7 +56,7 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
     args.model_path = os.path.realpath(args.model_path)
-        
+
     sampling_params = {
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
@@ -62,11 +72,12 @@ if __name__ == "__main__":
         pickle.dump(sampling_params, f)
     with open(os.path.join(mf_dir, 'sampling_params.pkl'), 'rb') as f:
         sampling_params = pickle.load(f)
-    
+
     server_args = ServerArgs.from_cli_args(args)
     with open(os.path.join(mf_dir, 'args.pkl'), 'wb') as f:
         pickle.dump(server_args, f)
     with open(os.path.join(mf_dir, 'args.pkl'), 'rb') as f:
         server_args = pickle.load(f)
-        
-    load_model(server_args)
+
+    model = load_model(server_args)
+    talk(model)
