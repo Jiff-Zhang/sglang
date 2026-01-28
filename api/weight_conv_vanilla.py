@@ -187,8 +187,6 @@ def run(
                         scale[:weight.size(0), :weight.size(1)]
                 else:
                     assert weight.dtype in [torch.bfloat16, torch.float16, torch.float32, torch.float]
-                tqdm.write(f"### {w_name} with shape {list(weight.shape)} ###")
-                    
             # if name.endswith(".weight_scale_inv"):
             #     s_name = name
             #     w_name = name.replace(".weight_scale_inv", ".weight")
@@ -202,11 +200,14 @@ def run(
             #         scale[:weight.size(0), :weight.size(1)]
                 ori_weight = weight
 
-                mf_tool = mf_tools["__default__"]
+                select_k = "__default__"
+                mf_tool = mf_tools[select_k]
                 for k in mf_tools:
                     if re.search(k, w_name):
                         mf_tool = mf_tools[k]
+                        select_k = k
                         break
+                tqdm.write(f"### {w_name} with shape {list(weight.shape)} in  <{select_k}> mode ###")
                 
                 # quantize: int8 weight + bfloat16 scale
                 scale_dtype = torch.float32
