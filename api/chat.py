@@ -94,7 +94,7 @@ def main(server_args, args):
         )
         response = responses[0]
         print(f"Assistant >> {response}")
-        prompt = input("User: ")
+        prompt = input("User >> ")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
