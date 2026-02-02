@@ -1238,6 +1238,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             prefix=add_prefix("attn_mha", prefix),
         )
 
+        # TODO: register moffett tool
+        register_mf_tool(self.attn_mha, config=config)
+        register_mf_tool(self.attn_mqa, config=config)
+
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
 
@@ -2275,10 +2279,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-
-        # TODO: register moffett tool
-        register_mf_tool(self.self_attn.attn_mha, config=config)
-        register_mf_tool(self.self_attn.attn_mqa, config=config)
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)

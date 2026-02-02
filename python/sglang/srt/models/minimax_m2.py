@@ -81,6 +81,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled
 )
 
+from sglang.srt.mf_tool import register_mf_tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -646,6 +648,8 @@ class MiniMaxM2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+
+        register_mf_tool(self.attn, config=config)
 
     def forward_prepare(
         self,

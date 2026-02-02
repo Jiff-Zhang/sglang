@@ -502,6 +502,9 @@ class Qwen3MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        
+        # TODO: register moffett tool
+        register_mf_tool(self.attn, config=config)
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -711,9 +714,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
         )
-        
-        # TODO: register moffett tool
-        register_mf_tool(self.self_attn.attn, config=config)
 
         self.layer_id = layer_id
 

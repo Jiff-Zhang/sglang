@@ -90,18 +90,19 @@ def main(server_args, args):
     model = load_model(server_args)
     prompt = input("User >> ")
     while prompt != "[exit]":
-        prompts = [prompt]
-        responses = query_llm(
-            prompts,
-            args.model_name,
-            model,
-            tokenizer,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-            apply_template=args.apply_template
-        )
-        response = responses[0]
-        print(f"Assistant >> {response}")
+        if prompt != "":
+            prompts = [prompt]
+            responses = query_llm(
+                prompts,
+                args.model_name,
+                model,
+                tokenizer,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                apply_template=args.apply_template
+            )
+            response = responses[0]
+            print(f"Assistant >> {response}")
         prompt = input("User >> ")
 
 if __name__ == "__main__":

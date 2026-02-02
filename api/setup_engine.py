@@ -36,14 +36,15 @@ def load_model(server_args: ServerArgs):
     outputs = model.generate(prompts, sampling_params)
 '''
 
-def talk(model):
+def talk(model, sampling_params):
     prompt = input("User >> ")
     while prompt != "[exit]":
-        prompts = [prompt]
-        outputs = model.generate(prompts, sampling_params)
-        responses = [output['text'].strip() for output in outputs]
-        response = responses[0]
-        print(f"Assistant >> {response}")
+        if prompt != "":
+            prompts = [prompt]
+            outputs = model.generate(prompts, sampling_params)
+            responses = [output['text'].strip() for output in outputs]
+            response = responses[0]
+            print(f"Assistant >> {response}")
         prompt = input("User >> ")
 
 if __name__ == "__main__":
