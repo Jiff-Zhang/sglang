@@ -31,10 +31,12 @@ def apply_w8a8_block_int8_linear(
             symmetric=True,
             hardware=True
         )
-        input_2d_n = tool.transform.preprocess(input_2d)
-        q_input, x_scale = tool.sym_quant(input_2d_n)
-        q_input = tool.transform.postprocess(q_input).to(torch.int8)
-        x_scale = tool.transform.postprocess(x_scale)
+        # input_2d_n = tool.transform.preprocess(input_2d)
+        # q_input, x_scale = tool.sym_quant(input_2d_n)
+        # q_input = tool.transform.postprocess(q_input).to(torch.int8)
+        # x_scale = tool.transform.postprocess(x_scale)
+        res = tool(input_2d, restore=False)
+        q_input, x_scale = res["x"].to(torch.int8), res["scales"]
     else:
         q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
     output = w8a8_block_int8_matmul(

@@ -712,12 +712,15 @@ def invoke_fused_moe_kernel(
                     mode="per_bank",
                     dtype="int8",
                     bank_size=block_k,
-                    symmetric=True
+                    symmetric=True,
+                    hardware=True
                 )
-                A = tool.transform.preprocess(A)
-                A, A_scale = tool.sym_quant(A)
-                A = tool.transform.postprocess(A).to(torch.int8)
-                A_scale = tool.transform.postprocess(A_scale)
+                # A = tool.transform.preprocess(A)
+                # A, A_scale = tool.sym_quant(A)
+                # A = tool.transform.postprocess(A).to(torch.int8)
+                # A_scale = tool.transform.postprocess(A_scale)
+                res = tool(A, restore=False)
+                A, A_scale = res["x"].to(torch.int8), res["scales"]
             else:
                 if _is_cuda:
                     A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
