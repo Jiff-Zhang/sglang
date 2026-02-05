@@ -138,7 +138,8 @@ def run(
             },
             quant_symmetric=True,
             quant_masked=True,
-            hardware=True
+            # hardware=True
+            hardware=False
         )
         for key, config in mf_linear_config.items()
     }
@@ -353,19 +354,10 @@ def save_extra(
     in_weight_dir, out_weight_dir, weight_map, 
     mf_linear_config, bank_size
 ):
-    file_list = [
-        "configuration.json",
-        "configuration_deepseek.py",
-        "configuration_minimax_m2.py",
-        "generation_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "modeling_deepseek.py",
-        "modeling_minimax_m2.py",
-        "inference",
-        "config.json",
-        "model.safetensors.index.json",
-    ]
+    file_list = filter(
+        lambda filepath: not filepath.endswith('.safetensors'), 
+        os.listdir(in_weight_dir)
+    )
     smooth = False
     for filepath in file_list:
         if os.path.exists(os.path.join(in_weight_dir, filepath)):
@@ -419,6 +411,10 @@ if __name__ == "__main__":
     in_weight_dir = "/ssd01/models/MiniMax-M2.1"
     out_weight_dir = "/ssd01/models/MiniMax-M2.1-MF-Int8"
     # out_weight_dir = "/ssd01/models/MiniMax-M2.1-MF-Linear_WInt8-MOE_W8xH8L3"
+    
+    in_weight_dir = "/ssd01/models/Kimi-K2-Instruct"
+    out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Int8"
+    # out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
     bank_size = 64

@@ -1871,7 +1871,27 @@ class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
 
         self.label_buffer[layer_id - self.start_layer][loc] = cache_k
         self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.set_label_buffer(
+            layer=layer,
+            loc=loc,
+            cache_k=cache_k,
+            cache_v=cache_v,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qo_indptr=qo_indptr
+        )
 
+    def set_label_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor=None, # [B]
+    ):
+        layer_id = layer.layer_id
         time_stamp = time.time()
         if "retrieve" in getattr(layer, 'modes', []):
             self.quantize(
@@ -1913,6 +1933,33 @@ class MFMLATokenToKVPool(MLATokenToKVPool, MFTokenToKVPool):
                 f"#kv_cache_avg_len: {avg_len:.2f}, "
             )
             self.time_stamp = time.time()
+        
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        kv_indptr: torch.Tensor, # [B]
+        kv_indices: torch.Tensor, # [S]
+        qo_indptr: torch.Tensor=None, # [B]
+    ):
+        super().set_mla_kv_buffer(
+            layer=layer,
+            loc=loc,
+            cache_k_nope=cache_k_nope,
+            cache_k_rope=cache_k_rope
+        )
+        cache_k = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+        self.set_label_buffer(
+            layer=layer,
+            loc=loc,
+            cache_k=cache_k,
+            cache_v=cache_k_nope,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qo_indptr=qo_indptr
+        )
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 

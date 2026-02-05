@@ -161,8 +161,6 @@ from sglang.srt.mf_tool import (
     register_mf_tool,
     is_logging_enabled
 )
-from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 if _use_aiter_gfx95:
 

@@ -18,6 +18,8 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, next_power_of_2
+from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -444,15 +446,29 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+            assert isinstance(
+                forward_batch.attn_backend, TritonAttnBackend
+            ), f"MFMLATokenToKVPool only supports TritonAttnBackend, but got {type(forward_batch.attn_backend)}"
+            _, kv_indptr, kv_indices, _ = forward_batch.attn_backend.get_extend_metadata(self.attn_mha)
+            qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
+            extra_kwargs = {
+                "kv_indptr": kv_indptr,
+                "kv_indices": kv_indices,
+                "qo_indptr": qo_indptr
+            }
+        else:
+            extra_kwargs = {}
+            
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe, **extra_kwargs
             )
         elif _is_npu:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe, **extra_kwargs
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -460,7 +476,7 @@ class DeepseekMHAForwardMixin:
 
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None, **extra_kwargs
             )
 
     def _get_mla_kv_buffer(
