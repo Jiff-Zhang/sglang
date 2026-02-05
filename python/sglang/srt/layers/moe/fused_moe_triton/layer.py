@@ -871,6 +871,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
             )
+            return
             
         raise NotImplementedError(
             f"Found unsupported weight name: {weight_name}"
