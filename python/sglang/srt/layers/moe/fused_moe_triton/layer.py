@@ -859,9 +859,6 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
             return
-        raise NotImplementedError(
-            f"Found unsupported weight name: {weight_name}"
-        )
 
         if (
             "bias" in weight_name
@@ -874,6 +871,10 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
             )
+            
+        raise NotImplementedError(
+            f"Found unsupported weight name: {weight_name}"
+        )
 
     def weight_loader_fused(
         self,
