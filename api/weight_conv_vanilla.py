@@ -414,7 +414,7 @@ if __name__ == "__main__":
     
     in_weight_dir = "/ssd01/models/Kimi-K2-Instruct"
     out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Int8"
-    # out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Linear_WInt8-MOE_W8xH8L3"
+    out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
     bank_size = 64
@@ -441,21 +441,21 @@ if __name__ == "__main__":
             },
             "smooth": smooth
         },
-        # ".*experts": {
-        #     "weight": {
-        #         "sparsity": 0.875,
-        #         "high_bits": high_bits,
-        #         "low_bits": low_bits,
-        #         "mask_in_id": True
-        #     },
-        #     "input": {
-        #         "sparsity": 0,
-        #         "high_bits": high_bits,
-        #         "low_bits": 0,
-        #         "mf_format": True
-        #     },
-        #     "smooth": smooth
-        # }
+        ".*experts": {
+            "weight": {
+                "sparsity": 0.875,
+                "high_bits": high_bits,
+                "low_bits": low_bits,
+                "mask_in_id": True
+            },
+            "input": {
+                "sparsity": 0,
+                "high_bits": high_bits,
+                "low_bits": 0,
+                "mf_format": True
+            },
+            "smooth": smooth
+        }
     }
     layers = [
         "gate_proj", "up_proj", "down_proj",

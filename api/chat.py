@@ -27,20 +27,12 @@ def load_model(server_args: ServerArgs):
     # raise Exception('stop')
     return model
 
-def query_llm(prompts, model_name, model, tokenizer, client=None, temperature=0.1, max_new_tokens=128, stop=None, apply_template=True):
+def query_llm(prompts, model, tokenizer, client=None, temperature=0.1, max_new_tokens=128, stop=None, apply_template=True):
     if apply_template:
         with ThreadPoolExecutor(max_workers=mp.cpu_count()//2) as executor:
             # 提交任务到线程池。
-            # TODO:
-            if 'DeepSeek-V3.1' in model_name:
-                # v3.1
-                add_generation_prompt = True
-                thinking = True
-                # thinking = False
-            else:
-                # v3 bug exists: to align with baseline which run with add_generation_prompt=False
-                add_generation_prompt = False
-                thinking = False
+            add_generation_prompt = True
+            thinking = False
             futures = [
                 executor.submit(
                     partial(
@@ -94,7 +86,6 @@ def main(server_args, args):
             prompts = [prompt]
             responses = query_llm(
                 prompts,
-                args.model_name,
                 model,
                 tokenizer,
                 temperature=args.temperature,
@@ -107,7 +98,6 @@ def main(server_args, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", "-m", type=str, default="GLM-4-9B-Chat")
     parser.add_argument("--temperature", "-t", type=float, default=0.1)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=-1)

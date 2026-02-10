@@ -12,11 +12,10 @@
 set -e
 
 if [[ $# -lt 7 ]]; then
-    echo "Usage: bash $0 <model> <model_path> <dist_init_addr> <node_rank> <nnodes> <tp> *args **kwargs"
+    echo "Usage: bash $0 <model_path> <dist_init_addr> <node_rank> <nnodes> <tp> *args **kwargs"
     exit
 fi
 
-model=$1 && shift
 model_path=$1 && shift
 dist_init_addr=$1 && shift
 node_rank=$1 && shift
@@ -34,7 +33,6 @@ export GLOO_SOCKET_IFNAME=eth0 \
     # --disable-cuda-graph \
 
 python -u $(dirname $0)/chat.py \
-    --model_name $model \
     --model-path $model_path \
     --random-seed ${random_seed} \
     --dist-init-addr $dist_init_addr \

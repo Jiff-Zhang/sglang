@@ -653,29 +653,39 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        if self.with_low_bits and self.mf_config["weight"]["mask_in_id"]:
-            w13_mask = generate_mask(
-                rearrange(layer.w13_mask_id, "E O (G I) N -> (E G O) I N", G=2),
-                self.quant_config.weight_block_size,
-                dtype=layer.w13_weight.dtype,
-            )
-            w13_mask = rearrange(
-                w13_mask,
-                "(E G O) I -> E O (G I)",
-                E=layer.w13_weight.size(0),
-                G=2
-            )
-            w2_mask = generate_mask(
-                rearrange(layer.w2_mask_id, "E O I N -> (E O) I N"),
-                self.quant_config.weight_block_size,
-                dtype=layer.w2_weight.dtype,
-            )
-            w2_mask = rearrange(
-                w2_mask, "(E O) I -> E O I", E=layer.w2_weight.size(0)
-            )
+        if self.with_low_bits:
+            if self.mf_config["weight"]["mask_in_id"]:
+                w13_mask = generate_mask(
+                    rearrange(layer.w13_mask_id, "E O (G I) N -> (E G O) I N", G=2),
+                    self.quant_config.weight_block_size,
+                    dtype=layer.w13_weight.dtype,
+                )
+                w13_mask = rearrange(
+                    w13_mask,
+                    "(E G O) I -> E O (G I)",
+                    E=layer.w13_weight.size(0),
+                    G=2
+                )
+                w2_mask = generate_mask(
+                    rearrange(layer.w2_mask_id, "E O I N -> (E O) I N"),
+                    self.quant_config.weight_block_size,
+                    dtype=layer.w2_weight.dtype,
+                )
+                w2_mask = rearrange(
+                    w2_mask, "(E O) I -> E O I", E=layer.w2_weight.size(0)
+                )
+            else:
+                w13_mask = layer.w13_mask
+                w2_mask = layer.w2_mask
+            w13_weight = layer.w13_weight * w13_mask
+            w13_lweight = layer.w13_weight * (1 - w13_mask)
+            w2_weight = layer.w2_weight * w2_mask
+            w2_lweight = layer.w2_weight * (1 - w2_mask)
         else:
-            w13_mask = layer.w13_mask
-            w2_mask = layer.w2_mask
+            w13_weight = layer.w13_weight
+            w13_lweight = None
+            w2_weight = layer.w2_weight
+            w2_lweight = None
 
         if self.mf_config["smooth"]:
             assert torch.allclose(
@@ -688,11 +698,11 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             w2_smooth_scale = None
         
         quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
             use_int8_w8a8=True,
-            w13_mask=w13_mask, # moffett
-            w2_mask=w2_mask, # moffett
+            w13_lweight=w13_lweight, # moffett
+            w2_lweight=w2_lweight, # moffett
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
             w13_lscale=layer.w13_weight_lscale_inv, # moffett

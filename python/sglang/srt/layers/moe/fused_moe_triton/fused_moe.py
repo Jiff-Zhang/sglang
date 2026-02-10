@@ -76,8 +76,8 @@ def inplace_fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
-    w1_mask: Optional[torch.Tensor] = None, # moffett
-    w2_mask: Optional[torch.Tensor] = None, # moffett
+    w1_l: Optional[torch.Tensor] = None, # moffett
+    w2_l: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_lscale: Optional[torch.Tensor] = None, # moffett
@@ -112,8 +112,8 @@ def inplace_fused_experts(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        w1_mask=w1_mask, # moffett
-        w2_mask=w2_mask, # moffett
+        w1_l=w1_l, # moffett
+        w2_l=w2_l, # moffett
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_lscale=w1_lscale, # moffett
@@ -151,8 +151,8 @@ def outplace_fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
-    w1_mask: Optional[torch.Tensor] = None, # moffett
-    w2_mask: Optional[torch.Tensor] = None, # moffett
+    w1_l: Optional[torch.Tensor] = None, # moffett
+    w2_l: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_lscale: Optional[torch.Tensor] = None, # moffett
@@ -188,8 +188,8 @@ def outplace_fused_experts(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        w1_mask=w1_mask, # moffett
-        w2_mask=w2_mask, # moffett
+        w1_l=w1_l, # moffett
+        w2_l=w2_l, # moffett
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_lscale=w1_lscale, # moffett
@@ -223,8 +223,8 @@ def fused_experts(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
-    w1_mask: Optional[torch.Tensor] = None, # moffett
-    w2_mask: Optional[torch.Tensor] = None, # moffett
+    w1_l: Optional[torch.Tensor] = None, # moffett
+    w2_l: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_lscale: Optional[torch.Tensor] = None, # moffett
@@ -261,8 +261,8 @@ def fused_experts(
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
-            w1_mask=w1_mask, # moffett
-            w2_mask=w2_mask, # moffett
+            w1_l=w1_l, # moffett
+            w2_l=w2_l, # moffett
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w1_lscale=w1_lscale, # moffett
@@ -298,8 +298,8 @@ def fused_experts(
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
-            w1_mask=w1_mask, # moffett
-            w2_mask=w2_mask, # moffett
+            w1_l=w1_l, # moffett
+            w2_l=w2_l, # moffett
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w1_lscale=w1_lscale, # moffett
@@ -356,8 +356,8 @@ def fused_experts_impl(
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
-    w1_mask: Optional[torch.Tensor] = None, # moffett
-    w2_mask: Optional[torch.Tensor] = None, # moffett
+    w1_l: Optional[torch.Tensor] = None, # moffett
+    w2_l: Optional[torch.Tensor] = None, # moffett
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_lscale: Optional[torch.Tensor] = None, # moffett
@@ -498,9 +498,10 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        if w1_mask is not None:
+        if w1_l is not None:
             assert w1_lscale is not None
-            w1_list = [w1 * w1_mask, w1 * (1 - w1_mask)]
+            assert w1_zp is None
+            w1_list = [w1, w1_l]
             b1_list = [None, b1]
             w1_scale_list = [w1_scale, w1_lscale]
         else:
@@ -597,9 +598,10 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
         
-        if w2_mask is not None:
+        if w2_l is not None:
             assert w2_lscale is not None
-            w2_list = [w2 * w2_mask, w2 * (1 - w2_mask)]
+            assert w2_zp is None
+            w2_list = [w2, w2_l]
             b2_list = [None, b2]
             w2_scale_list = [w2_scale, w2_lscale]
         else:

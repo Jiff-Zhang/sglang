@@ -87,8 +87,8 @@ class TritonRunnerOutput(RunnerOutput):
 class TritonMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    w13_mask: torch.Tensor = None # moffett
-    w2_mask: torch.Tensor = None # moffett
+    w13_lweight: Optional[torch.Tensor] = None # moffett
+    w2_lweight: Optional[torch.Tensor] = None # moffett
     b13: Optional[torch.Tensor] = None
     b2: Optional[torch.Tensor] = None
     use_fp8_w8a8: bool = False
@@ -356,8 +356,8 @@ def fused_experts_none_to_triton(
         use_int8_w8a16=quant_info.use_int8_w8a16,
         use_int4_w4a16=quant_info.use_int4_w4a16,
         per_channel_quant=quant_info.per_channel_quant,
-        w1_mask=quant_info.w13_mask, # moffett
-        w2_mask=quant_info.w2_mask, # moffett
+        w1_l=quant_info.w13_lweight, # moffett
+        w2_l=quant_info.w2_lweight, # moffett
         w1_scale=quant_info.w13_scale,
         w2_scale=quant_info.w2_scale,
         w1_lscale=quant_info.w13_lscale, # moffett
