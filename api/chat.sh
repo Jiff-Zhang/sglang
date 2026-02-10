@@ -11,7 +11,7 @@
 
 set -e
 
-if [[ $# -lt 7 ]]; then
+if [[ $# -lt 5 ]]; then
     echo "Usage: bash $0 <model_path> <dist_init_addr> <node_rank> <nnodes> <tp> *args **kwargs"
     exit
 fi
