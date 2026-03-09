@@ -94,6 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.logger import ColoredFormatter
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
@@ -1229,10 +1230,14 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    format = f"[%(asctime)s{maybe_ms}{prefix}] %(levelname)8s - %(message)s"
+    formatter = ColoredFormatter(format)
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
-        format=format,
+        # format=format,
+        handlers=[handler],
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )

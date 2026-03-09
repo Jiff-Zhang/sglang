@@ -4,6 +4,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import logging
 import torch
 from einops import rearrange
 
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
+logger = logging.getLogger(__name__)
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod

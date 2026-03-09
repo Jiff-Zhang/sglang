@@ -17,8 +17,10 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
+    MFMHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
+    MFMLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
@@ -78,6 +80,10 @@ class ModelRunnerKVCacheMixin:
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
+
+            # moffett
+            if self.use_mf_cache:
+                cell_size *= 2
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -111,6 +117,10 @@ class ModelRunnerKVCacheMixin:
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+
+            # moffett
+            if self.use_mf_cache:
+                cell_size = int(cell_size * 1.5)
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
@@ -488,7 +498,11 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
+                if self.use_mf_cache:
+                    MLATokenToKVPoolClass = MFMLATokenToKVPool
+                else:
+                    MLATokenToKVPoolClass = MLATokenToKVPool
+                self.token_to_kv_pool = MLATokenToKVPoolClass(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -596,7 +610,11 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    if self.use_mf_cache:
+                        MHATokenToKVPoolClass = MFMHATokenToKVPool
+                    else:
+                        MHATokenToKVPoolClass = MHATokenToKVPool
+                    self.token_to_kv_pool = MHATokenToKVPoolClass(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,

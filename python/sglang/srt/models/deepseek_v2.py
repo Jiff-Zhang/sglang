@@ -75,7 +75,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_dp_attention_enabled,
+    is_dp_attention_enabled
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -150,6 +150,13 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
+)
+
+from sglang.srt.mf_tool import (
+    MFSparseNbits,
+    TokenSparseRetriever,
+    register_mf_tool,
+    is_logging_enabled
 )
 
 if _use_aiter_gfx95:
@@ -1226,6 +1233,10 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mha", prefix),
         )
 
+        # TODO: register moffett tool
+        register_mf_tool(self.attn_mha, config=config)
+        register_mf_tool(self.attn_mqa, config=config)
+
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
 
@@ -1264,7 +1275,7 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_cpu_forward()
 
     def dispatch_attn_forward_method(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch,
     ) -> AttnForwardMethod:
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1350,12 +1361,25 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+
+        if is_logging_enabled() and self.layer_id == 0:
+            logger.debug(
+                f"<DeepseekV2AttentionMLA.forward_prepare> "
+                f"#attn_forward_method: {attn_forward_method, attn_forward_method.name}, "
+                f"#forward_mode: {forward_batch.forward_mode, forward_batch.forward_mode.name, forward_batch.forward_mode.is_decode()}, "
+                f"#hidden_states.shape: {list(hidden_states.shape)}, "
+            )
+
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_PREFILL:
+            inner_state = self.forward_normal_chunked_kv_prefill_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
@@ -1416,6 +1440,8 @@ class DeepseekV2AttentionMLA(
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV_PREFILL:
+            return self.forward_normal_chunked_kv_prefill_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:

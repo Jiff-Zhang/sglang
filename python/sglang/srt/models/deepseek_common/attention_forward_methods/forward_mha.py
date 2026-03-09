@@ -22,6 +22,8 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
 )
+from sglang.srt.mem_cache.memory_pool import MFMLATokenToKVPool
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -329,6 +331,64 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+    
+    def forward_normal_chunked_kv_prefill_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
+    def mla2mha_cache(self, latent_cache: torch.Tensor):
+        if latent_cache.size(0) == 0:
+            return torch.empty(
+                (0, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=latent_cache.dtype,
+                device=latent_cache.device,
+            ), torch.empty(
+                (0, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=latent_cache.dtype,
+                device=latent_cache.device,
+            )
+            
+        kv_a_normed, k_pe = latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_a_normed = kv_a_normed.squeeze(1).contiguous()
+        kv = self.kv_b_proj(kv_a_normed)[0]
+        kv = kv.view(
+            -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        v = kv[..., self.qk_nope_head_dim :]
+        k_nope = kv[..., : self.qk_nope_head_dim]
+
+        k = torch.empty(
+            (
+                k_nope.shape[0],
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+            ),
+            dtype=v.dtype,
+            device=v.device,
+        )
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        return k, v
+        
+    def forward_normal_chunked_kv_prefill_core(self, q, k, v, forward_batch):
+        attn_output = self.attn_mha(
+            q, k, v, forward_batch, save_kv_cache=False,
+            # using cache_func to transfer mla cache to mha cache
+            cache_func=lambda k, v: self.mla2mha_cache(k)
+        )
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,
@@ -412,15 +472,29 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if isinstance(forward_batch.token_to_kv_pool, MFMLATokenToKVPool):
+            assert isinstance(
+                forward_batch.attn_backend, TritonAttnBackend
+            ), f"MFMLATokenToKVPool only supports TritonAttnBackend, but got {type(forward_batch.attn_backend)}"
+            _, kv_indptr, kv_indices, _ = forward_batch.attn_backend.get_extend_metadata(self.attn_mha)
+            qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
+            extra_kwargs = {
+                "kv_indptr": kv_indptr,
+                "kv_indices": kv_indices,
+                "qo_indptr": qo_indptr
+            }
+        else:
+            extra_kwargs = {}
+            
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe, **extra_kwargs
             )
         elif _is_npu:
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe, **extra_kwargs
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -428,7 +502,7 @@ class DeepseekMHAForwardMixin:
 
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None, **extra_kwargs
             )
 
     def _get_mla_kv_buffer(

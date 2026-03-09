@@ -287,7 +287,13 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
+                                if q_a_proj_name.endswith(".smooth_scale"):
+                                    # TODO: check if smooth scale is the same
+                                    assert torch.allclose(
+                                        q_a_proj_weight, kv_a_proj_weight
+                                    ), f"Smooth scale of q_a_proj and kv_a_proj_with_mqa should be the same."
+                                    fused_weight = q_a_proj_weight
+                                elif q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight

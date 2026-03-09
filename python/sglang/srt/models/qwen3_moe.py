@@ -79,6 +79,8 @@ from sglang.srt.utils import (
     is_npu,
 )
 
+from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, register_mf_tool
+
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -480,9 +482,10 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        )
+        # self.compatible_with_fused_kv_buffer = (
+        #     False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+        # )
+        self.compatible_with_fused_kv_buffer = False
         self.compatible_with_fused_qk_norm_rope = (
             not isinstance(self.rotary_emb, MRotaryEmbedding)
         ) and self.head_dim in (64, 128, 256)
@@ -500,6 +503,9 @@ class Qwen3MoeAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        
+        # TODO: register moffett tool
+        register_mf_tool(self.attn, config=config)
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

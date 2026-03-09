@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -47,8 +48,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+from sglang.srt.mf_tool import is_logging_enabled, fp32_to_fp24 
 
 _is_hip = is_hip()
+logger = logging.getLogger(__name__)
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
@@ -222,6 +225,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        logits = fp32_to_fp24(logits)
+        
         from sgl_kernel import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
@@ -1382,6 +1387,27 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
+        nsa_impl = (
+            self.nsa_decode_impl
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+            else self.nsa_prefill_impl
+        )
+        
+        if is_logging_enabled() and layer.layer_id == 0:
+            logger.debug(
+                f"<NativeSparseAttnBackend.forward_extend> "
+                f"#NSA_PREFILL_IMPL: {nsa_impl}, "
+                f"#q_rope.shape: {list(q_rope.shape)}, "
+                f"#q_nope.shape: {list(q_nope.shape)}, "
+                f"#kv_cache.shape: {list(kv_cache.shape)}, "
+                f"#page_table_1.shape: {list(page_table_1.shape)}, "
+                # f"#page_table_1[:2]: {page_table_1[:2]}, "
+                # f"#metadata: {metadata}, "
+            )
+
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1536,6 +1562,17 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
+        if is_logging_enabled() and layer.layer_id == 0:
+            logger.debug(
+                f"<NativeSparseAttnBackend.forward_decode> "
+                f"#NSA_DECODE_IMPL: {self.nsa_decode_impl}, "
+                f"#q_rope.shape: {list(q_rope.shape)}, "
+                f"#q_nope.shape: {list(q_nope.shape)}, "
+                f"#kv_cache.shape: {list(kv_cache.shape)}, "
+                f"#page_table_1.shape: {list(page_table_1.shape)}, "
+                # f"#metadata: {metadata}, "
+            )
+        
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)

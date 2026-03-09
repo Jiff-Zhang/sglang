@@ -189,6 +189,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+from sglang.srt.mf_tool import default_mf_config
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -302,6 +303,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         draft_model_idx: Optional[int] = None,
     ):
+        # TODO: Whether to use Moffett tool, temporarily active when using MLATokenToKVPool
+        mf_config = getattr(
+            model_config.hf_config, "mf_config", default_mf_config
+        )
+        self.use_mf_cache = (
+            mf_config["active"] and (
+                "retrieve" in mf_config["modes"] or 
+                "cache_quant" in mf_config["modes"]
+            )
+        )
+        
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device

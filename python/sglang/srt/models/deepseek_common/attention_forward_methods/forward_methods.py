@@ -30,3 +30,6 @@ class AttnForwardMethod(IntEnum):
 
     # Use Deepseek V3.2 sparse multi-latent attention for NPU
     DSA_NPU = auto()
+
+    # Use MHA with chunked kv, only for prefill
+    MHA_CHUNKED_KV_PREFILL = auto()

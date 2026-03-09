@@ -2146,7 +2146,7 @@ class Scheduler(
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
-
+                    
             if self.running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption

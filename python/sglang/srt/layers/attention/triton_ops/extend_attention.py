@@ -16,7 +16,9 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import logging
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -24,6 +26,9 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.mf_tool import TokenSparseRetriever
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -108,6 +113,63 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
+
+@triton.jit
+def quantize_2d(
+    x,
+    num_bits: tl.constexpr,
+    bank_size: tl.constexpr,
+    dim: tl.constexpr,
+    magic_num: tl.constexpr=1.0,
+    active: tl.constexpr=False,
+):
+    if not active:
+        return x
+    
+    # TODO: quant attention weights
+    # tl.static_print(active, num_bits, bank_size, dim, x.shape)
+    # tl.device_print('max', tl.max(x))
+    # x_p = tl.zeros_like(x)
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+
+    # reshape to bank_size
+    x = tl.reshape(
+        x, 
+        (x.shape[0], x.shape[1] // bank_size, bank_size)
+    )
+    
+    # symmetric quantization
+    max_ranges = tl.max(tl.abs(x), axis=2, keep_dims=True) * magic_num
+    max_int = 2 ** (num_bits - 1) - 1
+    scales = max_ranges / max_int if num_bits > 1 else max_ranges
+    # scales = max_ranges / (max_int + 1) if self.num_bits > 1 else max_ranges
+
+    # set num less than smallest number to smallest number to avoid overflow
+    # smallest_normal = torch.finfo(x.dtype).smallest_normal * max_ranges.clamp(1) 
+    # scales = torch.maximum(scales, smallest_normal)
+    # scales[scales < smallest_normal] = smallest_normal
+    # scales[scales == 0] = 1
+    scales = tl.where(scales == 0, 1, scales)
+    
+    # quant
+    x = tl.clamp(
+        # TODO: check if tl.div_rn works noramlly
+        tl.floor(x / scales + 0.5),
+        # tl.div_rn(x, scales),
+        -max_int if num_bits > 1 else -1,
+        max_int
+    )
+    x = x * scales
+
+    # revert shape
+    x = tl.reshape(x, (x.shape[0], x.shape[1] * x.shape[2]))
+    
+    if dim != 1:
+        x = tl.trans(x, dim, 1)
+    # return tl.reshape(x, x_p.shape)
+    return x
 
 
 @triton.jit
@@ -222,6 +284,7 @@ def _fwd_kernel(
     K_Extend,
     V_Extend,
     O_Extend,
+    QK_SCORES,
     K_Buffer,
     V_Buffer,
     qo_indptr,
@@ -243,6 +306,9 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
+    stride_qkbs,
+    stride_qkh,
+    stride_qkq,
     stride_buf_kbs,
     stride_buf_kh,
     stride_buf_vbs,
@@ -262,6 +328,8 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    ACT_QUANT: tl.constexpr,
+    SAVE_QK_SCORES: tl.constexpr
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -375,6 +443,7 @@ def _fwd_kernel(
                 other=0.0,
             )
 
+            # tl.static_print(q.shape, k.shape)
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -398,6 +467,20 @@ def _fwd_kernel(
 
             qk = tl.where(final_mask, qk, float("-inf"))
 
+            if SAVE_QK_SCORES:
+                offs_qk = (
+                    cur_seq * stride_qkbs
+                    + cur_head * stride_qkh
+                    + (cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qkq
+                    + (start_n + offs_n[None, :])
+                )
+                tl.store(
+                    QK_SCORES + offs_qk,
+                    # qk,
+                    tl.cast(qk, tl.bfloat16),
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                )
+
             row_max = tl.max(qk, 1)
             row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
             n_e_max = tl.maximum(row_max_fixed, e_max)
@@ -415,6 +498,9 @@ def _fwd_kernel(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
+            )
+            p = quantize_2d(
+                p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT
             )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
@@ -504,6 +590,20 @@ def _fwd_kernel(
 
             qk = tl.where(final_mask, qk, float("-inf"))
 
+            if SAVE_QK_SCORES:
+                offs_qk = (
+                    cur_seq * stride_qkbs
+                    + cur_head * stride_qkh
+                    + (cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qkq
+                    + (cur_seq_len_prefix + start_n + offs_n[None, :])
+                )
+                tl.store(
+                    QK_SCORES + offs_qk,
+                    # qk,
+                    tl.cast(qk, tl.bfloat16),
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                )
+
             row_max = tl.max(qk, 1)
             row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
             n_e_max = tl.maximum(row_max_fixed, e_max)
@@ -519,6 +619,9 @@ def _fwd_kernel(
             )
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+            )
+            p = quantize_2d(
+                p, num_bits=8, bank_size=64, dim=1, active=ACT_QUANT
             )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
@@ -572,6 +675,10 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    act_quant=False,
+    prefill_retrieve=False,
+    prefill_retrieve_config={"k": None, "k_cache": None, "retriever": None, "out_cache_loc": None},
+    is_logging_enabled=False
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -606,12 +713,37 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    if prefill_retrieve:
+        # [B]
+        len_extend = qo_indptr[1:] - qo_indptr[:-1]
+        len_prefix = kv_indptr[1:] - kv_indptr[:-1]
+        # right padding
+        qk_scores = o_extend.new_ones(
+            (
+                batch_size,  head_num,
+                triton.cdiv(max_len_extend, BLOCK_M) * BLOCK_M,
+                (triton.cdiv(len_prefix.max(), BLOCK_N) + triton.cdiv(len_extend.max(), BLOCK_N)) * BLOCK_N
+            )
+        ) * float("-inf")
+        qk_scores = qk_scores.contiguous()
+        label_extend = prefill_retrieve_config["k"]
+        label_buffer = prefill_retrieve_config["k_cache"]
+        retriever = prefill_retrieve_config["retriever"]
+        # quantize q_extend for retriever
+        q_extend_re = retriever.q_tool(q_extend).contiguous()
+    else:
+        qk_scores = None
+        label_extend = None
+        label_buffer = None
+        q_extend_re = None
+
     _fwd_kernel[grid](
-        q_extend,
-        k_extend,
+        q_extend_re if prefill_retrieve else q_extend,
+        label_extend if  prefill_retrieve else k_extend,
         v_extend,
         o_extend,
-        k_buffer,
+        qk_scores,
+        label_buffer if prefill_retrieve else k_buffer,
         v_buffer,
         qo_indptr,
         kv_indptr,
@@ -632,6 +764,9 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
+        qk_scores.stride(0) if qk_scores is not None else 0,
+        qk_scores.stride(1) if qk_scores is not None else 0,
+        qk_scores.stride(2) if qk_scores is not None else 0,
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -653,9 +788,207 @@ def extend_attention_fwd(
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
+        ACT_QUANT=act_quant,
+        SAVE_QK_SCORES=qk_scores is not None,
         **extra_kargs,
     )
 
+    if prefill_retrieve:
+        out_cache_loc = prefill_retrieve_config["out_cache_loc"]
+        retriever = prefill_retrieve_config["retriever"]
+        retrieve(
+            q_extend=q_extend,
+            k_extend=k_extend,
+            v_extend=v_extend,
+            o_extend=o_extend,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qk_scores=qk_scores,
+            label_extend=label_extend,
+            label_buffer=label_buffer,
+            sm_scale=sm_scale,
+            out_cache_loc=out_cache_loc,
+            retriever=retriever,
+            is_logging_enabled=is_logging_enabled
+        )
+
+def retrieve(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    qk_scores,
+    label_extend,
+    label_buffer,
+    sm_scale,
+    out_cache_loc,
+    retriever: TokenSparseRetriever,
+    is_logging_enabled=False
+):
+    chunk_size = retriever.topk_chunk_size
+
+    # page_table = list()
+    # TODO: For flash-mla constraint
+    D_B_TOPK = 64 * 2
+    maxlen = retriever.retain_size + chunk_size
+    maxlen = (maxlen + D_B_TOPK - 1) // D_B_TOPK * D_B_TOPK
+    page_table = kv_indices.new_ones((q_extend.size(0), maxlen)) * -1
+    maxlen = 0
+    
+    # if is_logging_enabled:
+    #     logger.debug(f"Prefill retrieve: start")
+    # [1, H, 1, L]
+    trans_buffer = torch.ones_like(qk_scores[:1, :, :1])
+    for i, (q_s, k_s) in enumerate(zip(qo_indptr[:-1], kv_indptr[:-1])):
+        q_e, k_e = qo_indptr[i+1], kv_indptr[i+1]
+        # [L, H, D] -> [1, H, L, D]
+        label_buffer_all = torch.cat(
+            (label_extend[q_s: q_e], label_buffer[k_s: k_e]), dim=0
+        ).transpose(0, 1).unsqueeze(0)
+        for j in range(chunk_size):
+            for k in range(j, q_e - q_s, chunk_size):
+                context_len = k_e - k_s + k + 1
+                # transfer right padding to left padding
+                trans_buffer[..., -context_len:] = qk_scores[i: i+1, :, k: k+1, :context_len]
+                trans_buffer[..., :-context_len] = qk_scores[i: i+1, :, k: k+1, context_len:]
+                qk_scores[i: i+1, :, k: k+1].data.copy_(trans_buffer)
+
+            # count of this batch
+            qpc = (q_e - q_s - (j + 1)) // chunk_size + 1
+            # the maxlen of this batch
+            cur_maxlen = k_e - k_s + (j + 1) + (qpc - 1) * chunk_size
+            # the maxlen of all
+            maxlen = max(maxlen, cur_maxlen)
+            
+            retriever._reset()
+            retriever.seq_len = cur_maxlen
+            # [1, H, Q/C, L] -> [Q/C, H, 1, L]
+            attn_weights = qk_scores[i: i+1, :, j: q_e - q_s: chunk_size, -cur_maxlen:].transpose(0, 2)
+            retriever.key_buffer = label_buffer_all[:, :, :cur_maxlen] # .tile(attn_weights.size(0), 1, 1, 1)
+            # [Q/C, H, 1, L] -> [Q/C, H, 1, N]
+            idx = retriever._fetch_idx(
+                # [Q/C, H, D] -> [Q/C, H, 1, D]
+                q_extend[q_s+j: q_e: chunk_size].unsqueeze(2),
+                causal_mask=None,
+                attn_weights=attn_weights,
+            )
+            # TODO: only for DeepSeek MLA, [Q/C, H, 1, N] -> [Q/C, N]
+            idx = idx[:, 0, 0]
+            # [Q/C]
+            offset = torch.arange(
+                -qpc+1,
+                1,
+                device=idx.device,
+                dtype=idx.dtype
+            ) * chunk_size
+            idx += offset[:, None]
+            # idx.clamp_(min=-1)
+            # idx = idx.sort(dim=-1, descending=True).values
+            # for padding index
+            idx[idx < 0] = (k_e - k_s + q_e - q_s).to(idx.dtype)
+            idx = idx.sort(dim=-1, descending=False).values
+            # [k_e - k_s + q_e - q_s + 1] -> [Q/C, N]
+            indices = torch.cat(
+                [
+                    kv_indices[k_s: k_e],
+                    out_cache_loc[q_s: q_e],
+                    torch.ones_like(out_cache_loc[:1]) * -1 # for padding
+                ],
+                dim=-1
+            )[idx]
+            page_table[q_s+j: q_e: chunk_size, :indices.size(1)] = indices
+        """
+        # slow version
+        for j in range(q_e - q_s):
+            context_len = k_e - k_s + j + 1
+            if context_len > retriever.retain_size:
+                retriever._reset()
+                retriever.seq_len = context_len
+                retriever.key_buffer = label_buffer_all[:, :, :context_len]
+                # [1, H, 1, L] -> [1, H, 1, N]
+                idx = retriever._fetch_idx(
+                    # [1, H, D] -> [1, H, 1, D]
+                    q_extend[q_s+j: q_s+j+1].transpose(0, 1).unsqueeze(0),
+                    causal_mask=None,
+                    attn_weights=qk_scores[i: i+1, :, j: j+1, :context_len],
+                )
+                # TODO: only for DeepSeek MLA, [1, H, 1, N] -> [N]
+                idx = idx[0, 0, 0]
+            else:
+                idx = torch.arange(context_len, device=q_extend.device)
+            indices = torch.cat(
+                [kv_indices[k_s: k_e], out_cache_loc[q_s: q_e]],
+                dim=-1
+            )[idx]
+            # page_table.append(indices)
+            page_table[q_s+j, :indices.size(-1)] = indices
+            maxlen = max(maxlen, indices.size(-1))
+        """
+
+    # # padding
+    # maxlen = max([indices.size(0) for indices in page_table])
+    # # TODO: For flash-mla constraint
+    # D_B_TOPK = 64 * 2
+    # maxlen = (maxlen + D_B_TOPK - 1) // D_B_TOPK * D_B_TOPK
+    # page_table = [
+    #     F.pad(
+    #         indices,
+    #         (0, maxlen - indices.size(0)),
+    #         mode="constant",
+    #         value=-1
+    #     )
+    #     for indices in page_table
+    # ]
+    # page_table = torch.stack(page_table, dim=0)
+    
+    # truncate
+    maxlen = (maxlen + D_B_TOPK - 1) // D_B_TOPK * D_B_TOPK
+    page_table = page_table[:, :maxlen]
+    
+    if is_logging_enabled:
+        logger.debug(
+            f"Prefill retrieve: "
+            f"#q.shape: {list(q_extend.shape)}, "
+            # f"#kv_indptr.shape: {list(kv_indptr.shape)}, "
+            # f"#kv_indices.shape: {list(kv_indices.shape)}, "
+            f"#page_table.shape: {list(page_table.shape)}, "
+            # f"#page_table: {page_table, out_cache_loc.min()}, "
+            f"#k_cache.shape: {list(k_buffer.shape)}, "
+            f"#v_cache.shape: {list(v_buffer.shape)}, "
+        )
+    from flash_mla import flash_mla_sparse_fwd
+    # TODO: For flash-mla constraint
+    B_H = 64
+    if q_extend.size(1) % B_H != 0:
+        num_to_pad = B_H - q_extend.size(1) % B_H
+        q_pad = torch.cat(
+            # [q_extend] + [q_extend[:, :1].repeat(1, num_to_pad, 1)],
+            [q_extend] + [q_extend[:, :1]] * num_to_pad,
+            dim=1
+        )
+    else:
+        q_pad = q_extend
+    # if is_logging_enabled:
+    #     logger.debug(f"Prefill retrieve: padded")
+    o, _, _ = flash_mla_sparse_fwd(
+        q=q_pad,
+        kv=k_buffer,
+        indices=page_table.unsqueeze(1).to(torch.int32),
+        sm_scale=sm_scale,
+        d_v=v_extend.size(-1),
+    )
+    o = o[:, :q_extend.size(1)]
+    o_extend.data.copy_(o.data)
+    # if is_logging_enabled:
+    #     logger.debug(f"Prefill retrieve: done")
 
 def redundant_attention(
     q_extend,

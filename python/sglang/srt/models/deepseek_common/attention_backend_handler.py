@@ -156,6 +156,15 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # TODO: support prefill retrieve
+    if "prefill_retrieve" in getattr(attn.attn_mha, "modes", []):
+        return AttnForwardMethod.MLA
+
+    if forward_batch.forward_mode.is_decode():
+        return AttnForwardMethod.MLA
+    else:
+        return AttnForwardMethod.MHA_CHUNKED_KV_PREFILL
+    
     if is_in_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 

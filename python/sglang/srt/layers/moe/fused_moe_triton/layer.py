@@ -191,6 +191,9 @@ class FusedMoE(torch.nn.Module):
         is_gated: bool = True,
     ):
         super().__init__()
+        # name
+        self.name = prefix
+        
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -425,6 +428,14 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
+        # for smooth scale
+        if expert_data.size(shard_dim) == 2:
+            # each w1 and w3 in all rank share the same parameter respectively
+            tp_rank = 0
+            # logger.warning(
+            #     f"Found parameter with 2 in shard dimension, set tp_rank to 0 to make sure each w1 and w3 in all rank load the same parameter respectively."
+            # )
+        
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
@@ -847,8 +858,9 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Case model weights
-        if "weight" in weight_name:
+        # Case model weights or mask or mask_id
+        # if "weight" in weight_name:
+        if "weight" in weight_name or "mask" in weight_name:
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -869,6 +881,11 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
             )
+            return
+            
+        raise NotImplementedError(
+            f"Found unsupported weight name: {weight_name}"
+        )
 
     def weight_loader_fused(
         self,
