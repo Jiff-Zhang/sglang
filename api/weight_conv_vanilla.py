@@ -30,6 +30,22 @@ os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 
+# unpack int4 weight from int32 for Kimi-K2.5
+def unpack(
+    x: torch.Tensor, # [O, I / store_bits * data_bits]
+    store_bits: int=32,
+    data_bits: int=4,
+    dtype: torch.dtype=torch.int8
+) -> torch.Tensor:
+    assert store_bits % data_bits == 0
+    base = 2 ** data_bits - 1
+    res = list()
+    for i in range(0, store_bits, data_bits):
+        res.append((x >> i) & base)
+    res = torch.stack(res, dim=-1)
+    res -= 2 ** (data_bits - 1)
+    return rearrange(res, "... i j -> ... (i j)").to(dtype)
+
 def load_weight_map(index_file):
     with open(index_file) as f:
         weight_map = json.load(f)["weight_map"]
@@ -60,6 +76,11 @@ def set_tensor(weights, weight_map, weight_map_ref, name, tensor, key=None):
         weight_map[name] = weight_map[key]
         weight_map_ref[weight_map[name]].append(name)
     weights[weight_map[name]][name] = tensor
+
+def del_tensor(weights, weight_map, weight_map_ref, name):
+    weights[weight_map[name]].pop(name)
+    weight_map_ref[weight_map[name]].remove(name)
+    weight_map.pop(name)
 
 class ModelSaver:
     def __init__(self, config, out_dir: str):
@@ -148,6 +169,8 @@ def run(
     if partial_save:
         with open(os.path.join(in_weight_dir, "config.json"), "r") as fid:
             config = json.load(fid)
+            if "text_config" in config:
+                config = config["text_config"]
         weight_map_dict = {
             i: {
                 name: value for name, value in weight_map.items()
@@ -171,23 +194,59 @@ def run(
         else:
             w_block = None
     for layer_idx, weight_map in weight_map_dict.items():
+        # debug
+        # if layer_idx is not None and layer_idx > 4:
+        #     continue
+        
         for name in tqdm(list(weight_map.keys())[:], desc="Processing weights"):
-            if not name.endswith("weight"):
+            if not (
+                name.endswith("weight") or name.endswith("weight_packed")
+            ):
                 continue
             if any(l in name for l in layers):
-                w_name = name
-                s_name = name.replace(".weight", ".weight_scale_inv")
-                weight = get_tensor(weights, weight_map, w_name)
-                has_scale = s_name in weight_map
-                if has_scale:
-                    assert weight.dtype not in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                if name.endswith("weight"):
+                    w_name = name
+                    s_name = name.replace(".weight", ".weight_scale_inv")
+                    weight = get_tensor(weights, weight_map, w_name)
+                    has_scale = s_name in weight_map
+                    if has_scale:
+                        assert weight.dtype not in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                        scale = get_tensor(weights, weight_map, s_name)
+                        scale = scale.repeat_interleave(w_block[0], dim=0)
+                        scale = scale.repeat_interleave(w_block[1], dim=1)
+                        weight = weight.to(scale.dtype) * \
+                            scale[:weight.size(0), :weight.size(1)]
+                        del_tensor(weights, weight_map, weight_map_ref, s_name)
+                    else:
+                        assert weight.dtype in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                elif name.endswith("weight_packed"):
+                    w_name = name
+                    s_name = name.replace("_packed", "_scale")
+                    sh_name = name.replace("_packed", "_shape")
+                    weight = get_tensor(weights, weight_map, w_name)
                     scale = get_tensor(weights, weight_map, s_name)
-                    scale = scale.repeat_interleave(w_block[0], dim=0)
-                    scale = scale.repeat_interleave(w_block[1], dim=1)
-                    weight = weight.to(scale.dtype) * \
-                        scale[:weight.size(0), :weight.size(1)]
+                    shape = get_tensor(weights, weight_map, sh_name)
+                    # unpack int4 weight from int32
+                    weight = unpack(weight, store_bits=32, data_bits=4, dtype=torch.int8)
+                    # hardcode for Kimi-K2.5
+                    scale = scale.repeat_interleave(32, dim=-1)
+                    weight = weight.to(scale.dtype) * scale
+                    set_tensor(
+                        weights,
+                        weight_map,
+                        weight_map_ref,
+                        name.rstrip("_packed"),
+                        weight,
+                        key=w_name
+                    )
+                    del_tensor(weights, weight_map, weight_map_ref, w_name)
+                    del_tensor(weights, weight_map, weight_map_ref, s_name)
+                    del_tensor(weights, weight_map, weight_map_ref, sh_name)
+                    
+                    w_name = name.rstrip("_packed")
+                    s_name = w_name.replace(".weight", ".weight_scale_inv")
                 else:
-                    assert weight.dtype in [torch.bfloat16, torch.float16, torch.float32, torch.float]
+                    raise NotImplementedError
             # if name.endswith(".weight_scale_inv"):
             #     s_name = name
             #     w_name = name.replace(".weight_scale_inv", ".weight")
@@ -282,7 +341,7 @@ def run(
                     weight_map_ref,
                     s_name,
                     hscale.to(scale_dtype),
-                    key=s_name if has_scale else w_name
+                    key=w_name
                 )
                 set_tensor(
                     weights,
@@ -365,7 +424,11 @@ def save_extra(
                 with open(os.path.join(out_weight_dir, filepath), mode="w") as ofid, \
                         open(os.path.join(in_weight_dir, filepath), mode="r") as ifid:
                     info = json.load(ifid)
-                    info["quantization_config"] = {
+                    if "text_config" in info:
+                        config = info["text_config"]
+                    else:
+                        config = info
+                    config["quantization_config"] = {
                         "activation_scheme": "dynamic",
                         "quant_method": "blockwise_int8",
                         "mf_linear_config": mf_linear_config,
@@ -420,6 +483,10 @@ if __name__ == "__main__":
     # out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Int8"
     # out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Linear_WInt8-MOE_W8xH8L3"
     
+    in_weight_dir = "/ssd01/models/Kimi-K2.5"
+    out_weight_dir = "/ssd01/models/Kimi-K2.5-MF-Int8"
+    # out_weight_dir = "/ssd01/models/Kimi-K2.5-MF-Linear_WInt8-MOE_W8xH8L3"
+    
     # vanilla version
     bank_size = 64
     high_bits = 8
@@ -445,27 +512,27 @@ if __name__ == "__main__":
             },
             "smooth": smooth
         },
-        ".*experts": {
-            "weight": {
-                "sparsity": 0.875,
-                "high_bits": high_bits,
-                "low_bits": low_bits,
-                "mask_in_id": True
-            },
-            "input": {
-                "sparsity": 0,
-                "high_bits": high_bits,
-                "low_bits": 0,
-                "mf_format": True
-            },
-            "smooth": smooth
-        }
+        # ".*experts": {
+        #     "weight": {
+        #         "sparsity": 0.875,
+        #         "high_bits": high_bits,
+        #         "low_bits": low_bits,
+        #         "mask_in_id": True
+        #     },
+        #     "input": {
+        #         "sparsity": 0,
+        #         "high_bits": high_bits,
+        #         "low_bits": 0,
+        #         "mf_format": True
+        #     },
+        #     "smooth": smooth
+        # }
     }
     layers = [
         "gate_proj", "up_proj", "down_proj",
         "k_proj", "v_proj", "q_proj", "o_proj",
         "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
-        "w1", "w2", "w3", # MiniMax-M2.1
+        "w1", "w2", "w3", # MiniMax-M2.1 / MiniMax-M2.5
     ]
     
     run(
