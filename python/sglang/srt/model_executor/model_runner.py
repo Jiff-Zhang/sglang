@@ -304,8 +304,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         draft_model_idx: Optional[int] = None,
     ):
         # TODO: Whether to use Moffett tool, temporarily active when using MLATokenToKVPool
+        language_config = model_config.hf_config
+        # TODO: hardcode for Kimi-K2.5
+        if "text_config" in language_config:
+            language_config = language_config.text_config
         mf_config = getattr(
-            model_config.hf_config, "mf_config", default_mf_config
+            language_config, "mf_config", default_mf_config
         )
         self.use_mf_cache = (
             mf_config["active"] and (
