@@ -655,6 +655,7 @@ def fused_experts_impl(
         if w2_l is not None:
             assert w2_lscale is not None
             assert w2_zp is None
+            assert not use_fused_moe_sum_all_reduce
             w2_list = [w2, w2_l]
             b2_list = [None, b2]
             w2_scale_list = [w2_scale, w2_lscale]
@@ -677,10 +678,8 @@ def fused_experts_impl(
                 else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
             )
         )
-        if w2_l is not None:
-            assert not use_fused_moe_sum_all_reduce
-            output_cache.zero_()
-            
+        output_cache.zero_()
+        
         output_cache_p = torch.empty_like(output_cache)
         for w2_p, b2_p, w2_scale_p in zip(w2_list, b2_list, w2_scale_list):
             invoke_fused_moe_kernel(

@@ -483,8 +483,8 @@ if __name__ == "__main__":
     out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Int8"
     # out_weight_dir = "/ssd01/models/Kimi-K2-Instruct-MF-Linear_WInt8-MOE_W8xH8L3"
     
-    # in_weight_dir = "/ssd01/models/Kimi-K2.5"
-    # out_weight_dir = "/ssd01/models/Kimi-K2.5-MF-Int8"
+    in_weight_dir = "/ssd01/models/Kimi-K2.5"
+    out_weight_dir = "/ssd01/models/Kimi-K2.5-MF-Int8"
     # out_weight_dir = "/ssd01/models/Kimi-K2.5-MF-Linear_WInt8-MOE_W8xH8L3"
     
     # vanilla version
