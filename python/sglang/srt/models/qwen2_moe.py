@@ -72,6 +72,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.mf_tool import save as mf_save
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ _is_cuda = is_cuda()
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
+        layer_id: int,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
@@ -91,6 +93,7 @@ class Qwen2MoeMLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -123,9 +126,31 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        mf_save(
+            gate_up,
+            name=f"mlp-moe-shared_experts-gate_up" if "shared_experts" in self.prefix else f"mlp-gate_up",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=2
+        )
         x = self.act_fn(gate_up)
+        mf_save(
+            x,
+            name=f"mlp-moe-shared_experts-act_fn" if "shared_experts" in self.prefix else f"mlp-act_fn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
+        mf_save(
+            x,
+            name=f"mlp-moe-shared_experts-down" if "shared_experts" in self.prefix else f"mlp-down",
+            layer_id=self.layer_id,
+            gather=False,
         )
         return x
 
@@ -452,6 +477,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         else:
             self.mlp = Qwen2MoeMLP(
+                layer_id=layer_id,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -584,6 +610,13 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        mf_save(
+            hidden_states,
+            name='embedding',
+            layer_id=None,
+            gather=False,
+        )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

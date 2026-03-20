@@ -21,7 +21,7 @@ def save(
     dim: int=-1,
     nt: int=1, # number of tensors
 ):
-    return
+    # return
     # if layer_id is not None and layer_id > 3:
     #     return
 
@@ -45,10 +45,8 @@ def save(
     logger.debug(f"ori_shape: {list(ori_shape)}, x.shape: {list(x.shape)}")
 
     out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-R1"
-    # out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus/official-save"
-    # out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus/MF-Int8-smooth-save"
-    # out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus/MF-W8xH8L3-save"
-    # out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus/MF-Linear_WInt8-MOE_W8xH8L3-save"
+    out_dir = "/ssd01/workspace/sglang-n/exp/data/DeepSeek-V3.1-Terminus/"
+    out_dir = "/ssd01/workspace/sglang-n/exp/data/Qwen3-235B-A22B-Instruct-2507"
     if layer_id is not None:
         out_dir = os.path.join(out_dir, f"layer{layer_id:02d}")
     os.makedirs(out_dir, exist_ok=True)

@@ -27,20 +27,12 @@ def load_model(server_args: ServerArgs):
     # raise Exception('stop')
     return model
 
-def query_llm(prompts, model_name, model, tokenizer, client=None, temperature=0.1, max_new_tokens=128, stop=None, apply_template=True):
+def query_llm(prompts, model, tokenizer, client=None, temperature=0.1, max_new_tokens=128, stop=None, apply_template=True):
     if apply_template:
         with ThreadPoolExecutor(max_workers=mp.cpu_count()//2) as executor:
             # 提交任务到线程池。
-            # TODO:
-            if 'DeepSeek-V3.1' in model_name:
-                # v3.1
-                add_generation_prompt = True
-                thinking = True
-                # thinking = False
-            else:
-                # v3 bug exists: to align with baseline which run with add_generation_prompt=False
-                add_generation_prompt = False
-                thinking = False
+            add_generation_prompt = True
+            thinking = False
             futures = [
                 executor.submit(
                     partial(
@@ -63,13 +55,21 @@ def query_llm(prompts, model_name, model, tokenizer, client=None, temperature=0.
         #     for prompt in tqdm(prompts, desc="Apply template")
         # ]
 
+    # sampling_params = {
+    #     "temperature": args.temperature,
+    #     "max_new_tokens": args.max_new_tokens,
+    #     # "max_new_tokens": 10,
+    #     "stop": stop,
+    #     # "top_p": args.top_p,
+    #     # "top_k": args.top_k,
+    #     "n": 1,
+    # }
     sampling_params = {
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
-        # "max_new_tokens": 10,
-        "stop": stop,
-        # "top_p": args.top_p,
-        # "top_k": args.top_k,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
         "n": 1,
     }
 
@@ -82,24 +82,26 @@ def main(server_args, args):
     model = load_model(server_args)
     prompt = input("User >> ")
     while prompt != "[exit]":
-        prompts = [prompt]
-        responses = query_llm(
-            prompts,
-            args.model_name,
-            model,
-            tokenizer,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-            apply_template=args.apply_template
-        )
-        response = responses[0]
-        print(f"Assistant >> {response}")
-        prompt = input("User: ")
+        if prompt != "":
+            prompts = [prompt]
+            responses = query_llm(
+                prompts,
+                model,
+                tokenizer,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                apply_template=args.apply_template
+            )
+            response = responses[0]
+            print(f"Assistant >> {response}")
+        prompt = input("User >> ")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", "-m", type=str, default="GLM-4-9B-Chat")
     parser.add_argument("--temperature", "-t", type=float, default=0.1)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=-1)
+    parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--max_new_tokens", "-mt", type=int, default=128)
     parser.add_argument("--apply_template", action='store_true')
     ServerArgs.add_cli_args(parser)

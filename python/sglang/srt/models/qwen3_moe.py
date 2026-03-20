@@ -72,7 +72,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
 )
 
-from sglang.srt.mf_tool import MFSparseNbits, TokenSparseRetriever, register_mf_tool
+from sglang.srt.mf_tool import register_mf_tool, save as mf_save
 
 Qwen3MoeConfig = None
 
@@ -168,6 +168,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        
+        mf_save(
+            topk_output.router_logits,
+            name=f"mlp-moe-gate",
+            layer_id=self.layer_id,
+            gather=False,
+        )
+        mf_save(
+            topk_output.topk_ids,
+            name=f"mlp-moe-topk_ids",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        mf_save(
+            topk_output.topk_weights,
+            name=f"mlp-moe-topk_weights",
+            layer_id=self.layer_id,
+            gather=False
+        )
+        
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -175,6 +195,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            
+        mf_save(
+            final_hidden_states,
+            name=f"mlp-moe-all_reduce",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -287,6 +314,7 @@ class Qwen3MoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_id = layer_id
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
@@ -407,7 +435,47 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        mf_save(
+            q,
+            name=f"attn-q",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            k,
+            name=f"attn-k",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            v,
+            name=f"attn-v",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         q, k = self._apply_qk_norm(q, k)
+        mf_save(
+            q,
+            name=f"attn-q_norm",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            k,
+            name=f"attn-k_norm",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -423,6 +491,22 @@ class Qwen3MoeAttention(nn.Module):
                 else None
             ),
         )
+        mf_save(
+            q,
+            name=f"attn-q_rot",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
+        mf_save(
+            k,
+            name=f"attn-k_rot",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -437,7 +521,21 @@ class Qwen3MoeAttention(nn.Module):
                 and self.compatible_with_fused_kv_buffer
             ),
         )
+        mf_save(
+            attn_output,
+            name=f"attn",
+            layer_id=self.layer_id,
+            gather=True,
+            dim=-1,
+            nt=1
+        )
         output, _ = self.o_proj(attn_output)
+        mf_save(
+            output,
+            name=f"attn-o",
+            layer_id=self.layer_id,
+            gather=False
+        )
         return output
 
     def forward(
@@ -519,6 +617,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         else:
             self.mlp = Qwen3MoeMLP(
+                layer_id=self.layer_id,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -555,6 +654,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        mf_save(
+            hidden_states,
+            name=f"add_norm",
+            layer_id=self.layer_id,
+            gather=False
+        )
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -565,6 +670,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        mf_save(
+            hidden_states,
+            name=f"post_add_norm",
+            layer_id=self.layer_id,
+            gather=False
         )
 
         should_allreduce_fusion = (
@@ -581,6 +692,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+        mf_save(
+            hidden_states,
+            name=f"mlp",
+            layer_id=self.layer_id,
+            gather=False,
+        )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -588,6 +705,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            
+        mf_save(
+            hidden_states,
+            name=f"output",
+            layer_id=self.layer_id,
+            gather=False,
+        )
 
         return hidden_states, residual
 
