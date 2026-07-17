@@ -395,6 +395,7 @@ class Indexer(MultiPlatformOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
+        self.k_sparsity_factor = envs.SGLANG_DSA_INDEX_K_SPARSITY_FACTOR.get()
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -544,6 +545,23 @@ class Indexer(MultiPlatformOp):
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+
+    def _maybe_sparsify_k(self, key: torch.Tensor) -> torch.Tensor:
+        factor = self.k_sparsity_factor
+        if factor <= 1:
+            return key
+
+        head_dim = key.shape[-1]
+        block_size = 64
+        assert head_dim % block_size == 0, f"head_dim {head_dim} not divisible by block_size {block_size}"
+        keep_per_block = block_size // factor
+
+        key_2d = key.view(-1, head_dim // block_size, block_size)
+        _, top_indices = torch.topk(key_2d.abs(), keep_per_block, dim=-1, sorted=False)
+        mask = torch.zeros_like(key_2d, dtype=torch.bool)
+        mask.scatter_(-1, top_indices, True)
+        key_2d[~mask] = 0.0
+        return key
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         if (
@@ -1649,6 +1667,8 @@ class Indexer(MultiPlatformOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+
+        key = self._maybe_sparsify_k(key)
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
