@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -396,6 +397,8 @@ class Indexer(MultiPlatformOp):
             and not is_neox_style
         )
         self.k_sparsity_factor = envs.SGLANG_DSA_INDEX_K_SPARSITY_FACTOR.get()
+        self.two_stage_n = envs.SGLANG_DSA_INDEX_TWO_STAGE_N.get()
+        self.two_stage_enabled = self.two_stage_n > 1 and self.k_sparsity_factor > 1
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -712,6 +715,7 @@ class Indexer(MultiPlatformOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
+            # Write buffer A with fused kernel (norm+rope+quant+store)
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
@@ -723,6 +727,18 @@ class Indexer(MultiPlatformOp):
                 positions,
                 page_size,
             )
+            # Mode C: write buffer B via fallback path (norm+rope → sparsify → store)
+            if self.two_stage_enabled:
+                key = fused_k_indexer_norm_rope(
+                    key_raw,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions,
+                )
+                self._maybe_sparsify_k(key)
+                self._write_to_buffer(key, pool, layer_id, out_cache_loc, act_quant, use_sparse=True)
             return
 
         # Fallback: separate K kernel + store kernel.
@@ -921,7 +937,6 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
         if (
@@ -941,6 +956,165 @@ class Indexer(MultiPlatformOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+
+        if self.two_stage_enabled:
+            # === Two-stage decode ===
+            pool = get_token_to_kv_pool()
+            k_stage1 = math.ceil(self.index_topk * self.two_stage_n)
+
+            # Short sequence: skip two-stage entirely.
+            if seqlens_32.max().item() <= k_stage1:
+                _saved = self.two_stage_enabled
+                self.two_stage_enabled = False
+                try:
+                    return self._get_topk_paged(
+                        forward_batch, layer_id, q_fp8, weights, metadata,
+                    )
+                finally:
+                    self.two_stage_enabled = _saved
+
+            # Stage 1: read sparse buffer B, run paged MQA logits
+            kv_cache_sparse = pool.get_index_k_with_scale_buffer_sparse(layer_id)
+            if kv_cache_sparse is None:
+                logger.warning(
+                    "two_stage_enabled but sparse buffer is None; falling back to single-stage"
+                )
+                self.two_stage_enabled = False
+                return self._get_topk_paged(
+                    forward_batch, layer_id, q_fp8, weights, metadata,
+                )
+            kv_cache_sparse = kv_cache_sparse.view(
+                kv_cache_sparse.shape[0], blocksize, 1, 132
+            )
+            w_sq = weights.squeeze(2)
+
+            if self.paged_mqa_logits_backend.is_aiter():
+                logits1 = aiter_paged_mqa_logits(
+                    q_fp8, kv_cache_sparse, w_sq, seqlens_32, block_tables,
+                    max_seq_len, preshuffle=_use_aiter_preshuffle, kv_block_size=blocksize,
+                )
+            else:
+                use_cute_dsl = (
+                    self.paged_mqa_logits_backend.is_cutedsl()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                )
+                dsl_expand_factor, dsl_atom = 1, 1
+                if use_cute_dsl and forward_batch.forward_mode.is_target_verify() and next_n >= 2:
+                    dsl_expand_factor, dsl_atom = pick_dsl_expand(
+                        next_n, batch_size=B, max_ctx=max_seq_len,
+                        num_sms=self.sm_count, kernel_atoms=(1, 2, 3, 4),
+                        num_heads=self.n_heads,
+                    )
+                ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+                use_dg_native = (
+                    not use_cute_dsl and _is_cuda
+                    and forward_batch.forward_mode.is_target_verify()
+                    and next_n >= 2 and ctx_2d is not None
+                    and ctx_2d.shape == (B, next_n)
+                )
+                if use_dg_native:
+                    seqlens_32_2d = ctx_2d
+                elif seqlens_32.dim() == 2:
+                    seqlens_32_2d = seqlens_32
+                else:
+                    seqlens_32_2d = seqlens_32.unsqueeze(-1)
+                if _is_cuda and schedule_metadata is None:
+                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32_2d, blocksize, self.sm_count
+                    )
+                if use_cute_dsl:
+                    logits1 = cutedsl_paged_mqa_logits(
+                        q_fp8, kv_cache_sparse, w_sq, metadata.get_seqlens_int32(),
+                        block_tables, schedule_metadata, max_seq_len,
+                        q_offset=q_offset, B=B, next_n=next_n,
+                        is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                        dsl_expand_factor=dsl_expand_factor, dsl_atom=dsl_atom,
+                        blocksize=blocksize, sm_count=self.sm_count,
+                        get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                    )
+                elif use_dg_native:
+                    logits1 = deepgemm_paged_mqa_logits_native(
+                        deep_gemm.fp8_paged_mqa_logits, q_fp8, kv_cache_sparse,
+                        w_sq, seqlens_32_2d, block_tables, schedule_metadata,
+                        max_seq_len, q_offset=q_offset, B=B, next_n=next_n,
+                    )
+                else:
+                    logits1 = deepgemm_paged_mqa_logits_split(
+                        deep_gemm.fp8_paged_mqa_logits, q_fp8, kv_cache_sparse,
+                        w_sq, seqlens_32_2d, block_tables, schedule_metadata,
+                        max_seq_len, q_offset=q_offset,
+                    )
+
+            self._mask_init_and_local_tokens(logits1, seqlens_32)
+            stage1_idx = metadata.topk_transform(logits1, k_stage1)
+            # stage1_idx: (B, k_stage1) (or (q, k_stage1) for target_verify/extend)
+
+            # Stage 2: dense buffer A → paged MQA logits → restrict to stage1_idx → topk
+            kv_dense = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            kv_dense = kv_dense.view(
+                kv_dense.shape[0], blocksize, 1, 132
+            )
+
+            if self.paged_mqa_logits_backend.is_aiter():
+                logits2 = aiter_paged_mqa_logits(
+                    q_fp8, kv_dense, w_sq, seqlens_32, block_tables,
+                    max_seq_len, preshuffle=_use_aiter_preshuffle, kv_block_size=blocksize,
+                )
+            elif use_cute_dsl:
+                logits2 = cutedsl_paged_mqa_logits(
+                    q_fp8, kv_dense, w_sq, metadata.get_seqlens_int32(),
+                    block_tables, schedule_metadata, max_seq_len,
+                    q_offset=q_offset, B=B, next_n=next_n,
+                    is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                    dsl_expand_factor=dsl_expand_factor, dsl_atom=dsl_atom,
+                    blocksize=blocksize, sm_count=self.sm_count,
+                    get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                )
+            elif use_dg_native:
+                logits2 = deepgemm_paged_mqa_logits_native(
+                    deep_gemm.fp8_paged_mqa_logits, q_fp8, kv_dense,
+                    w_sq, seqlens_32_2d, block_tables, schedule_metadata,
+                    max_seq_len, q_offset=q_offset, B=B, next_n=next_n,
+                )
+            else:
+                logits2 = deepgemm_paged_mqa_logits_split(
+                    deep_gemm.fp8_paged_mqa_logits, q_fp8, kv_dense,
+                    w_sq, seqlens_32_2d, block_tables, schedule_metadata,
+                    max_seq_len, q_offset=q_offset,
+                )
+
+            # Restrict to stage1_idx positions (chunked for memory)
+            CHUNK = 1024
+            q_size = stage1_idx.shape[0]
+            for start in range(0, q_size, CHUNK):
+                end = min(start + CHUNK, q_size)
+                chunk_idx = stage1_idx[start:end]
+                chunk_valid = chunk_idx >= 0
+                if not chunk_valid.any():
+                    logits2[start:end].fill_(float('-inf'))
+                    continue
+                rows, cols = torch.where(chunk_valid)
+                kv_pos = chunk_idx[chunk_valid]
+                saved = logits2[rows + start, kv_pos]
+                logits2[start:end].fill_(float('-inf'))
+                logits2[rows + start, kv_pos] = saved
+
+            self._mask_init_and_local_tokens(logits2, seqlens_32)
+            final = metadata.topk_transform(logits2, self.index_topk)
+
+            topk_result = final
+            if not _is_hip and q_offset < q_fp8.shape[0]:
+                pad_len = q_fp8.shape[0] - q_offset
+                padding = torch.full(
+                    (pad_len, topk_result.shape[1]), -1,
+                    dtype=topk_result.dtype, device=topk_result.device,
+                )
+                topk_result = torch.cat([topk_result, padding], dim=0)
+            return topk_result
+
+        # === Original single-stage decode logic ===
+        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1145,12 +1319,14 @@ class Indexer(MultiPlatformOp):
         else:
             assert page_size == 64, "only support page size 64"
 
-        assert len(weights.shape) == 3
+        # Accept 3D (batch, n_heads, 1) or already-squeezed 2D from recursive fallback
+        if weights.dim() == 3:
+            assert weights.shape[-1] == 1
+        weights = weights.squeeze(-1)
         assert (
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
-        weights = weights.squeeze(-1)
 
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
@@ -1180,6 +1356,164 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        q_offset = ks.shape[0]
+
+        if self.two_stage_enabled:
+            # === Two-stage prefill ===
+            pool = get_token_to_kv_pool()
+            k_stage1 = math.ceil(self.index_topk * self.two_stage_n)
+
+            # Short sequence: skip two-stage entirely.
+            if max_seq_len <= k_stage1:
+                _saved = self.two_stage_enabled
+                self.two_stage_enabled = False
+                try:
+                    return self._get_topk_ragged(
+                        enable_dual_stream, forward_batch, layer_id,
+                        q_fp8, weights, metadata, topk_result,
+                    )
+                finally:
+                    self.two_stage_enabled = _saved
+
+            # Stage 1: read sparse K from buffer B
+            k_sparse, s_sparse = pool.get_index_k_scale_buffer_from_sparse(
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                block_tables,
+                seq_len_sum,
+                max_seq_len,
+            )
+            if k_sparse is None or s_sparse is None:
+                logger.warning(
+                    "two_stage_enabled but sparse buffer is None; falling back to single-stage"
+                )
+                self.two_stage_enabled = False
+                return self._get_topk_ragged(
+                    enable_dual_stream, forward_batch, layer_id,
+                    q_fp8, weights, metadata, topk_result,
+                )
+            if _is_fp8_fnuz:
+                k_sparse = k_sparse.view(torch.float8_e4m3fnuz)
+            else:
+                k_sparse = k_sparse.view(torch.float8_e4m3fn)
+            s_sparse = s_sparse.view(torch.float32).squeeze(-1)
+            kv_sparse = (k_sparse, s_sparse)
+            k_offset_sparse = k_sparse.shape[0]
+
+            # Stage 2: read dense buffer A
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                block_tables,
+                seq_len_sum,
+                max_seq_len,
+            )
+            if _is_fp8_fnuz:
+                k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+            else:
+                k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
+            kv_dense = (k_fp8, k_scale)
+
+            # Chunk query dimension to bound peak memory
+            _, logits_budget_bytes = self._should_chunk_mqa_logits(
+                q_offset, k_fp8.shape[0], device_index
+            )
+            bytes_per_row = k_fp8.shape[0] * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, q_offset)
+
+            global_topk_offset = metadata.attn_metadata.topk_indices_offset
+            cu_seqlens_q_full = None
+            if global_topk_offset is None:
+                cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
+
+            start = 0
+            while start < q_offset:
+                end = min(start + max_rows, q_offset)
+                q_chunk = q_fp8[start:end]
+                w_chunk = weights[start:end]
+                ks_chunk = ks[start:end]
+                ke_chunk = ke[start:end]
+                lens_chunk = seq_lens_expanded[start:end]
+
+                if global_topk_offset is not None:
+                    topk_offset_chunk = global_topk_offset[start:end]
+                    cu_seqlens_q_chunk = None
+                    batch_idx_chunk = None
+                else:
+                    topk_offset_chunk = None
+                    cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
+                    batch_idx_chunk = token_to_batch_idx[start:end]
+
+                # Stage 1: sparse buffer B → topk positions
+                with self._with_real_sm_count():
+                    if _is_hip:
+                        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                        kv_b, scale_b = kv_sparse
+                        logits1 = fp8_mqa_logits(
+                            q_chunk, kv_b, scale_b, w_chunk, ks_chunk, ke_chunk,
+                            clean_logits=False,
+                        )
+                    else:
+                        q_pad, w_pad, _ = self._pad_heads_for_deep_gemm(
+                            q_chunk, w_chunk
+                        )
+                        logits1 = deep_gemm.fp8_mqa_logits(
+                            q_pad, kv_sparse, w_pad, ks_chunk, ke_chunk,
+                            clean_logits=False,
+                        )
+
+                self._mask_init_and_local_tokens(logits1, lens_chunk, ks_chunk)
+                stage1_chunk = metadata.topk_transform(
+                    logits1, k_stage1,
+                    ks=ks_chunk, ke_offset=lens_chunk,
+                )
+
+                # Stage 2: dense buffer A → restrict to stage1 positions → topk
+                with self._with_real_sm_count():
+                    if _is_hip:
+                        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+                        kv_d, scale_d = kv_dense
+                        logits2 = fp8_mqa_logits(
+                            q_chunk, kv_d, scale_d, w_chunk, ks_chunk, ke_chunk,
+                            clean_logits=False,
+                        )
+                    else:
+                        logits2 = deep_gemm.fp8_mqa_logits(
+                            q_pad, kv_dense, w_pad, ks_chunk, ke_chunk,
+                            clean_logits=False,
+                        )
+
+                # Restrict to stage1_chunk positions
+                CHUNK_R = 1024
+                for r_start in range(0, stage1_chunk.shape[0], CHUNK_R):
+                    r_end = min(r_start + CHUNK_R, stage1_chunk.shape[0])
+                    chunk_idx = stage1_chunk[r_start:r_end]
+                    chunk_valid = chunk_idx >= 0
+                    if not chunk_valid.any():
+                        logits2[r_start:r_end].fill_(float('-inf'))
+                        continue
+                    rows, cols = torch.where(chunk_valid)
+                    kv_pos = chunk_idx[chunk_valid]
+                    saved = logits2[rows + r_start, kv_pos]
+                    logits2[r_start:r_end].fill_(float('-inf'))
+                    logits2[rows + r_start, kv_pos] = saved
+
+                self._mask_init_and_local_tokens(logits2, lens_chunk, ks_chunk)
+                topk_result[start:end] = metadata.topk_transform(
+                    logits2, self.index_topk,
+                    ks=ks_chunk, cu_seqlens_q=cu_seqlens_q_chunk,
+                    ke_offset=lens_chunk, batch_idx_list=batch_idx_chunk,
+                    topk_indices_offset_override=topk_offset_chunk,
+                )
+
+                start = end
+            return topk_result
+
+        # === Original single-stage logic (mode A/B) ===
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
@@ -1196,9 +1530,6 @@ class Indexer(MultiPlatformOp):
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        token_to_batch_idx = metadata.get_token_to_batch_idx()
-        q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
@@ -1211,10 +1542,6 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    # Match the CUDA deep_gemm path (clean_logits=False): the topk
-                    # transform masks invalid positions via ks/ke/lengths, so the
-                    # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
-                    # redundant and grows quadratically with context length.
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
@@ -1270,7 +1597,6 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    # clean_logits=False: topk transform handles masking (see above)
                     logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
                         kv,
@@ -1296,14 +1622,11 @@ class Indexer(MultiPlatformOp):
             lengths_chunk = seq_lens_expanded[start:end]
             self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
 
-            # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
             if global_topk_offset is not None:
-                # RAGGED path
                 topk_offset_chunk = global_topk_offset[start:end]
                 cu_seqlens_q_chunk = None
                 batch_idx_chunk = None
             else:
-                # PAGED path: treat each token as a length-1 sequence
                 topk_offset_chunk = None
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
@@ -1647,6 +1970,65 @@ class Indexer(MultiPlatformOp):
         topk_indices = torch.cat(topk_indices_list, dim=0)
         return topk_indices
 
+    def _write_to_buffer(
+        self,
+        key: torch.Tensor,
+        pool,
+        layer_id: int,
+        out_cache_loc: torch.Tensor,
+        act_quant,
+        *,
+        use_sparse: bool = False,
+    ) -> None:
+        """Write key to indexer K buffer A (use_sparse=False) or B (use_sparse=True)."""
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
+        buf = (
+            pool.get_index_k_with_scale_buffer_sparse(layer_id=layer_id)
+            if use_sparse
+            else pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        )
+        if buf is None:
+            return
+
+        if (
+            _is_cuda
+            and (not _is_fp8_fnuz)
+            and can_use_dsa_fused_store(
+                key.dtype,
+                out_cache_loc.dtype,
+                pool.page_size,
+            )
+        ):
+            fused_store_index_k_cache(key, buf, out_cache_loc, pool.page_size)
+            return
+
+        if _use_aiter:
+            page_size = pool.page_size
+            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
+            out_loc = out_cache_loc if out_cache_loc.is_contiguous() else out_cache_loc.contiguous()
+            indexer_k_quant_and_cache(
+                key, kv_cache, out_loc, self.block_size, self.scale_fmt,
+                preshuffle=_use_aiter_preshuffle,
+            )
+            return
+
+        # Fallback
+        assert act_quant is not None
+        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        loc = out_cache_loc if out_cache_loc.is_contiguous() else out_cache_loc.contiguous()
+        if use_sparse:
+            pool.set_index_k_scale_buffer_sparse(
+                layer_id=layer_id, loc=loc, index_k=k_fp8, index_k_scale=k_scale,
+            )
+        else:
+            pool.set_index_k_scale_buffer(
+                layer_id=layer_id, loc=loc, index_k=k_fp8, index_k_scale=k_scale,
+            )
+
     def _store_index_k_cache(
         self,
         forward_batch: ForwardBatch,
@@ -1659,77 +2041,24 @@ class Indexer(MultiPlatformOp):
         """
         Store DSA indexer K cache for current step.
 
-        Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
-        Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
-
-        out_cache_loc will default to forward_batch.out_cache_loc if not provided.
+        Mode A/B:  sparsify (if f>1) then write to buffer A.
+        Mode C:    write original key to buffer A, then sparsify and write to buffer B.
         """
-
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
-        key = self._maybe_sparsify_k(key)
-
         pool = get_token_to_kv_pool()
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
 
-        if (
-            _is_cuda
-            and (not _is_fp8_fnuz)
-            and can_use_dsa_fused_store(
-                key.dtype,
-                out_cache_loc.dtype,
-                pool.page_size,
-            )
-        ):
-            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                pool.page_size,
-            )
-            return
-
-        # Fast path: AITER fused quant + cache store
-        # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
-        # layout (page_size>=16). Otherwise we fall back to the legacy row-major
-        # layout with page_size=1; the same kv_cache.view works for both cases
-        # because page_size is 1 there.
-        if _use_aiter:
-            page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
-            if not out_loc.is_contiguous():
-                out_loc = out_loc.contiguous()
-            indexer_k_quant_and_cache(
-                key,
-                kv_cache,
-                out_loc,
-                self.block_size,
-                self.scale_fmt,
-                preshuffle=_use_aiter_preshuffle,
-            )
-            return
-
-        # Fallback: original path
-        assert act_quant is not None
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-
-        if not out_cache_loc.is_contiguous():
-            out_cache_loc = out_cache_loc.contiguous()
-
-        pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
+        if self.two_stage_enabled:
+            # Mode C: write original key to buffer A first
+            self._write_to_buffer(key, pool, layer_id, out_cache_loc, act_quant, use_sparse=False)
+            # Then sparsify and write to buffer B
+            self._maybe_sparsify_k(key)
+            self._write_to_buffer(key, pool, layer_id, out_cache_loc, act_quant, use_sparse=True)
+        else:
+            # Mode A/B: existing behavior
+            key = self._maybe_sparsify_k(key)
+            self._write_to_buffer(key, pool, layer_id, out_cache_loc, act_quant, use_sparse=False)
 
     def forward_xpu(
         self,
@@ -2021,6 +2350,11 @@ class Indexer(MultiPlatformOp):
                     forward_batch.attn_cp_metadata is not None
                     and is_dsa_prefill_cp_in_seq_split()
                 ):
+                    if self.two_stage_enabled:
+                        logger.warning(
+                            "Two-stage indexer is enabled but context-parallel prefill "
+                            "path does not support it yet. Falling back to single-stage."
+                        )
                     kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
                     kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
                     actual_seq_q_prev = (
@@ -2079,6 +2413,11 @@ class Indexer(MultiPlatformOp):
                         metadata,
                     )
         else:
+            if self.two_stage_enabled:
+                logger.warning(
+                    "Two-stage indexer is enabled but NPU forward_indexer "
+                    "path does not support it yet. Falling back to single-stage."
+                )
             topk_result = self.forward_indexer(
                 q_fp8.contiguous(),
                 weights,

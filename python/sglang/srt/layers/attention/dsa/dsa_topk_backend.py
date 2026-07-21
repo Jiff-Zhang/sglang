@@ -121,6 +121,24 @@ class DSATopKBackend(Enum):
                 fast_topk_transform_ragged_fused,
             )
 
+            # sgl_kernel fused kernels only support topk == 2048.
+            # Fall back to unfused topk with logical-index conversion for
+            # other topk values (e.g. two-stage decode/prefill).
+            if topk != 2048:
+                indices = _topk_unfused(
+                    logits,
+                    lengths,
+                    topk,
+                    row_starts=row_starts,
+                    topk_op_kwargs={"sorted": False},
+                )
+                if row_starts is not None:
+                    rs = row_starts.to(
+                        dtype=torch.int32, device=indices.device
+                    ).unsqueeze(1)
+                    indices = torch.where(indices >= 0, indices + rs, -1)
+                return indices
+
             if topk_transform_method == TopkTransformMethod.PAGED:
                 page_table_size_1 = (
                     attn_metadata.page_table_1[batch_idx_list]
@@ -212,24 +230,30 @@ def _topk_unfused(
     else:
         row_starts = row_starts.to(dtype=torch.int32, device=score.device)
     lengths = lengths.to(dtype=torch.int32, device=score.device)
+    row_ends = row_starts + lengths
 
-    col_indices = torch.arange(max_score_len, dtype=torch.int32, device=score.device)
-    col_indices = col_indices.unsqueeze(0)
-    row_starts_unsqueezed = row_starts.unsqueeze(1)
-    row_ends_unsqueezed = (row_starts + lengths).unsqueeze(1)
-    valid_mask = (col_indices >= row_starts_unsqueezed) & (
-        col_indices < row_ends_unsqueezed
-    )
-
-    masked_logits = score.masked_fill(~valid_mask, float("-inf"))
     valid_topk = min(topk, max_score_len)
     topk_kwargs = topk_op_kwargs or {}
-    topk_scores, topk_col_indices = topk_op(masked_logits, valid_topk, **topk_kwargs)
-    topk_local_indices = topk_col_indices.to(torch.int32) - row_starts_unsqueezed
-    topk_local_indices = topk_local_indices.masked_fill(
-        topk_scores == float("-inf"), -1
-    )
-    topk_indices[:, :valid_topk] = topk_local_indices
+    col_indices = torch.arange(
+        max_score_len, dtype=torch.int32, device=score.device
+    ).unsqueeze(0)
+
+    chunk_size = 2048
+    for start in range(0, batch_size, chunk_size):
+        end = min(start + chunk_size, batch_size)
+        rs_chunk = row_starts[start:end].unsqueeze(1)
+        re_chunk = row_ends[start:end].unsqueeze(1)
+        valid_chunk = (col_indices >= rs_chunk) & (col_indices < re_chunk)
+
+        score_chunk = score[start:end]
+        score_chunk.masked_fill_(~valid_chunk, float("-inf"))
+
+        chunk_scores, chunk_col_indices = topk_op(
+            score_chunk, valid_topk, **topk_kwargs
+        )
+        chunk_local = chunk_col_indices.to(torch.int32) - rs_chunk
+        chunk_local = chunk_local.masked_fill(chunk_scores == float("-inf"), -1)
+        topk_indices[start:end, :valid_topk] = chunk_local
 
     return topk_indices
 

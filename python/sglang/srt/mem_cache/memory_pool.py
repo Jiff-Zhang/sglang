@@ -3164,6 +3164,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
+        self.two_stage_enabled = (
+            envs.SGLANG_DSA_INDEX_TWO_STAGE_N.get() > 1
+            and envs.SGLANG_DSA_INDEX_K_SPARSITY_FACTOR.get() > 1
+        )
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -3209,10 +3213,22 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
+            if self.two_stage_enabled:
+                self.index_k_with_scale_buffer_sparse = [
+                    torch.zeros(
+                        self._index_buffer_shape(num_pages),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            else:
+                self.index_k_with_scale_buffer_sparse = [None] * self.layer_num
 
     def _clear_buffers(self):
         super()._clear_buffers()
         del self.index_k_with_scale_buffer
+        del self.index_k_with_scale_buffer_sparse
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
@@ -3225,11 +3241,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
         src_loc_flat = src_loc.view(-1).long()
         for index_k in self.index_k_with_scale_buffer:
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
+        if self.two_stage_enabled:
+            for index_k_sparse in self.index_k_with_scale_buffer_sparse:
+                if index_k_sparse is not None:
+                    index_k_sparse[tgt_loc_flat] = index_k_sparse[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_with_scale_buffer_sparse(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_with_scale_buffer_sparse[layer_id - self.start_layer]
 
     def get_index_k_continuous(
         self,
@@ -3300,6 +3325,42 @@ class DSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
+    def set_index_k_scale_buffer_sparse(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer_sparse[layer_id - self.start_layer]
+        if buf is None:
+            return
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
+
+    def get_index_k_scale_buffer_from_sparse(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.index_k_with_scale_buffer_sparse[layer_id - self.start_layer]
+        if buf is None:
+            return None
+        return index_buf_accessor.GetKAndS.execute(
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
@@ -3323,7 +3384,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
 
-        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        result = {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        if self.two_stage_enabled:
+            index_k_sparse_cpu = []
+            for layer_id in range(self.layer_num):
+                index_k_sparse_cpu.append([])
+                for i in range(0, len(page_indices), page_chunk_size):
+                    chunk_page_indices = page_indices[i : i + page_chunk_size]
+                    idx_cpu = self.index_k_with_scale_buffer_sparse[layer_id][
+                        chunk_page_indices
+                    ].to("cpu", non_blocking=True)
+                    index_k_sparse_cpu[-1].append(idx_cpu)
+            torch.cuda.synchronize()
+            result["index_k_sparse"] = index_k_sparse_cpu
+        return result
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         super().load_cpu_copy(
@@ -3345,6 +3419,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
+        if self.two_stage_enabled:
+            index_k_sparse_cpu = kv_cache_cpu_dict.get("index_k_sparse")
+            if index_k_sparse_cpu is not None:
+                for layer_id in range(self.layer_num):
+                    for i in range(0, len(page_indices), page_chunk_size):
+                        chunk_page_indices = page_indices[i : i + page_chunk_size]
+                        idx_cpu = index_k_sparse_cpu[layer_id][i // page_chunk_size]
+                        assert idx_cpu.shape[0] == len(chunk_page_indices)
+                        idx_chunk = idx_cpu.to(
+                            self.index_k_with_scale_buffer_sparse[0].device, non_blocking=True
+                        )
+                        self.index_k_with_scale_buffer_sparse[layer_id][chunk_page_indices] = idx_chunk
+            torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
         data_ptrs = [
@@ -3356,12 +3443,26 @@ class DSATokenToKVPool(MLATokenToKVPool):
         item_lens = [
             self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
+        if self.two_stage_enabled:
+            data_ptrs.extend(
+                self.index_k_with_scale_buffer_sparse[i].data_ptr() for i in range(self.layer_num)
+            )
+            data_lens.extend(
+                self.index_k_with_scale_buffer_sparse[i].nbytes for i in range(self.layer_num)
+            )
+            item_lens.extend(
+                self.index_k_with_scale_buffer_sparse[i][0].nbytes for i in range(self.layer_num)
+            )
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.two_stage_enabled:
+            for index_k_cache in self.index_k_with_scale_buffer_sparse:
+                if index_k_cache is not None:
+                    kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
 

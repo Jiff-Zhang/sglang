@@ -216,9 +216,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
+                indexer_size = (
                     indexer_size_per_token * effective_num_layers * element_size
                 )
+                if (
+                    envs.SGLANG_DSA_INDEX_TWO_STAGE_N.get() > 1
+                    and envs.SGLANG_DSA_INDEX_K_SPARSITY_FACTOR.get() > 1
+                ):
+                    indexer_size *= 2
+                cell_size += indexer_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

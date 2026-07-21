@@ -226,12 +226,34 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 device=self.device,
             )
             self.remote_index_layer_id: Optional[int] = None
+            if self.two_stage_enabled:
+                self.index_k_with_scale_buffer_sparse = [
+                    torch.zeros(
+                        self._index_buffer_shape(
+                            num_pages if self._is_layer_owned(self.start_layer + i) else 0
+                        ),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=self.device,
+                    )
+                    for i in range(self.layer_num)
+                ]
+                self.remote_index_k_with_scale_buffer_sparse = torch.empty(
+                    self._index_buffer_shape(num_pages),
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=self.device,
+                )
+                self.remote_index_layer_id_sparse: Optional[int] = None
+            else:
+                self.index_k_with_scale_buffer_sparse = [None] * self.layer_num
 
     def _clear_buffers(self):
         del self.kv_buffer
         del self.remote_kv_buffer
         del self.remote_index_k_with_scale_buffer
         del self.index_k_with_scale_buffer
+        del self.index_k_with_scale_buffer_sparse
+        if hasattr(self, "remote_index_k_with_scale_buffer_sparse"):
+            del self.remote_index_k_with_scale_buffer_sparse
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
@@ -241,6 +263,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.two_stage_enabled:
+            for index_k_cache in self.index_k_with_scale_buffer_sparse:
+                if index_k_cache is not None and index_k_cache.shape[0] > 0:
+                    kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
     def get_contiguous_buf_infos(self):
@@ -422,6 +448,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if index_k.shape[0] == 0:
                 continue
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
+        if self.two_stage_enabled:
+            for index_k_sparse in self.index_k_with_scale_buffer_sparse:
+                if index_k_sparse is None or index_k_sparse.shape[0] == 0:
+                    continue
+                index_k_sparse[tgt_loc_flat] = index_k_sparse[src_loc_flat]
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 
@@ -477,6 +508,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
         if self.remote_index_layer_id == layer_id:
             self.remote_index_layer_id = None
+        if self.two_stage_enabled and hasattr(self, "remote_index_layer_id_sparse"):
+            if self.remote_index_layer_id_sparse == layer_id:
+                self.remote_index_layer_id_sparse = None
 
     def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
         if self.remote_index_layer_id != layer_id:
@@ -494,6 +528,54 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_index_layer_id = layer_id
         return self.remote_index_k_with_scale_buffer
 
+    def get_index_k_with_scale_buffer_sparse(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.two_stage_enabled:
+            return self._get_broadcastable_index_buffer_sparse(layer_id)
+        return self.index_k_with_scale_buffer_sparse[layer_id - self.start_layer]
+
+    def set_index_k_scale_buffer_sparse(self, layer_id, loc, index_k, index_k_scale) -> None:
+        self.invalidate_index_buffer_for_layer(layer_id)
+        if not self.two_stage_enabled or not self._is_layer_owned(layer_id):
+            return
+        buf = self.index_k_with_scale_buffer_sparse[layer_id - self.start_layer]
+        if buf is None or buf.shape[0] == 0:
+            return
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
+
+    def get_index_k_scale_buffer_from_sparse(
+        self, layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+    ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if not self.two_stage_enabled:
+            return None
+        buf = self._get_broadcastable_index_buffer_sparse(layer_id)
+        self.prefetch_kv_buffer(layer_id)
+        return index_buf_accessor.GetKAndS.execute(
+            self, buf, page_indices=page_indices, seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum, max_seq_len=max_seq_len,
+        )
+
+    def _get_broadcastable_index_buffer_sparse(self, layer_id: int) -> torch.Tensor:
+        if self.remote_index_layer_id_sparse != layer_id:
+            local_idx = self._local_layer_idx(layer_id)
+            src_tensor = (
+                self.index_k_with_scale_buffer_sparse[local_idx]
+                if self._is_layer_owned(layer_id)
+                else None
+            )
+            self._broadcast_tensor_from_owner(
+                self.remote_index_k_with_scale_buffer_sparse,
+                layer_id,
+                src_tensor=src_tensor,
+            )
+            self.remote_index_layer_id_sparse = layer_id
+        return self.remote_index_k_with_scale_buffer_sparse
+
     def get_state_buf_infos(self):
         owned_layer_ids = [
             i
@@ -507,6 +589,16 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         item_lens = [
             self.index_k_with_scale_buffer[i][0].nbytes for i in owned_layer_ids
         ]
+        if self.two_stage_enabled:
+            data_ptrs.extend(
+                self.index_k_with_scale_buffer_sparse[i].data_ptr() for i in owned_layer_ids
+            )
+            data_lens.extend(
+                self.index_k_with_scale_buffer_sparse[i].nbytes for i in owned_layer_ids
+            )
+            item_lens.extend(
+                self.index_k_with_scale_buffer_sparse[i][0].nbytes for i in owned_layer_ids
+            )
         return data_ptrs, data_lens, item_lens
 
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
@@ -544,7 +636,23 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 ].to("cpu", non_blocking=True)
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
-        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        result = {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        if self.two_stage_enabled:
+            index_k_sparse_cpu = []
+            for layer_id in range(self.layer_num):
+                index_k_sparse_cpu.append([])
+                if self.index_k_with_scale_buffer_sparse[layer_id] is None or \
+                        self.index_k_with_scale_buffer_sparse[layer_id].shape[0] == 0:
+                    continue
+                for i in range(0, len(page_indices), page_chunk_size):
+                    chunk_page_indices = page_indices[i : i + page_chunk_size]
+                    idx_cpu = self.index_k_with_scale_buffer_sparse[layer_id][
+                        chunk_page_indices
+                    ].to("cpu", non_blocking=True)
+                    index_k_sparse_cpu[-1].append(idx_cpu)
+            torch.cuda.synchronize()
+            result["index_k_sparse"] = index_k_sparse_cpu
+        return result
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         from sglang.srt.utils import current_platform
@@ -579,3 +687,20 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
+        if self.two_stage_enabled:
+            index_k_sparse_cpu = kv_cache_cpu_dict.get("index_k_sparse")
+            if index_k_sparse_cpu is not None:
+                for layer_id in range(self.layer_num):
+                    if self.index_k_with_scale_buffer_sparse[layer_id] is None or \
+                            self.index_k_with_scale_buffer_sparse[layer_id].shape[0] == 0:
+                        continue
+                    for i in range(0, len(page_indices), page_chunk_size):
+                        chunk_page_indices = page_indices[i : i + page_chunk_size]
+                        idx_cpu = index_k_sparse_cpu[layer_id][i // page_chunk_size]
+                        assert idx_cpu.shape[0] == len(chunk_page_indices)
+                        idx_chunk = idx_cpu.to(
+                            self.index_k_with_scale_buffer_sparse[layer_id].device,
+                            non_blocking=True
+                        )
+                        self.index_k_with_scale_buffer_sparse[layer_id][chunk_page_indices] = idx_chunk
+            torch.cuda.synchronize()

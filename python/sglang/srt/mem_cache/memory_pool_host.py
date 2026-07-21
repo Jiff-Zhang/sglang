@@ -1707,7 +1707,10 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
+        self.two_stage_enabled = getattr(device_pool, 'two_stage_enabled', False)
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
+        if self.two_stage_enabled:
+            buf_elem_size *= 2
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         host_mem = psutil.virtual_memory()
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
@@ -1744,6 +1747,12 @@ class DSAIndexerPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.two_stage_enabled:
+            self.index_k_device_ptrs_sparse = torch.tensor(
+                [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer_sparse],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
                 (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
@@ -1760,6 +1769,22 @@ class DSAIndexerPoolHost(HostKVCache):
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
+            if self.two_stage_enabled:
+                self.index_k_with_scale_buffer_sparse = alloc_func(
+                    (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+                self.index_k_data_refs_sparse = [
+                    self.index_k_with_scale_buffer_sparse[i] for i in range(self.layer_num)
+                ]
+                self.index_k_data_ptrs_sparse = torch.tensor(
+                    [x.data_ptr() for x in self.index_k_data_refs_sparse],
+                    dtype=torch.uint64,
+                    device=self.device_pool.device,
+                )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(
                 (
@@ -1773,11 +1798,25 @@ class DSAIndexerPoolHost(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
+            if self.two_stage_enabled:
+                self.index_k_with_scale_buffer_sparse = alloc_func(
+                    (
+                        self.indexer_page_num,
+                        self.layer_num,
+                        1,
+                        self.indexer_page_stride_size,
+                    ),
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
+        self.staging_buffer_sparse = None
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
@@ -1797,9 +1836,23 @@ class DSAIndexerPoolHost(HostKVCache):
             dtype=self.indexer_dtype,
             device=self.device_pool.device,
         )
+        if self.two_stage_enabled:
+            self.staging_buffer_sparse = torch.empty(
+                (
+                    staging_page_capacity,
+                    self.layer_num,
+                    1,
+                    self.indexer_page_stride_size,
+                ),
+                dtype=self.indexer_dtype,
+                device=self.device_pool.device,
+            )
 
     def get_hybrid_pool_buffer(self):
-        return [self.index_k_with_scale_buffer]
+        bufs = [self.index_k_with_scale_buffer]
+        if self.two_stage_enabled:
+            bufs.append(self.index_k_with_scale_buffer_sparse)
+        return bufs
 
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
@@ -1871,6 +1924,51 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+        if getattr(device_pool, 'two_stage_enabled', False):
+            if use_kernel:
+                if self.layout == "layer_first":
+                    transfer_kv_per_layer_mla(
+                        src=self.index_k_with_scale_buffer_sparse[host_layer],
+                        dst=device_pool.index_k_with_scale_buffer_sparse[layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
+                elif self.layout == "page_first":
+                    transfer_kv_per_layer_mla_pf_lf(
+                        src=self.index_k_with_scale_buffer_sparse,
+                        dst=device_pool.index_k_with_scale_buffer_sparse[layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        layer_id=host_layer,
+                        item_size=self.indexer_page_stride_size,
+                        src_layout_dim=self.indexer_layout_dim,
+                    )
+                else:
+                    raise ValueError(f"Unsupported layout: {self.layout}")
+            elif io_backend == "direct":
+                if self.layout == "layer_first":
+                    transfer_kv_direct(
+                        src_layers=[self.index_k_with_scale_buffer_sparse[host_layer]],
+                        dst_layers=[device_pool.index_k_with_scale_buffer_sparse[layer_id]],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        page_size=1,
+                    )
+                elif self.layout == "page_first_direct":
+                    transfer_kv_per_layer_direct_pf_lf(
+                        src_ptrs=[self.index_k_with_scale_buffer_sparse],
+                        dst_ptrs=[device_pool.index_k_with_scale_buffer_sparse[layer_id]],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        layer_id=host_layer,
+                        page_size=1,
+                    )
+                else:
+                    raise ValueError(f"Unsupported layout: {self.layout}")
+            else:
+                raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -1911,6 +2009,40 @@ class DSAIndexerPoolHost(HostKVCache):
                 )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        if getattr(device_pool, 'two_stage_enabled', False):
+            if use_kernel:
+                if self.layout == "layer_first":
+                    transfer_kv_per_layer_mla(
+                        src=device_pool.index_k_with_scale_buffer_sparse[layer_id],
+                        dst=self.index_k_with_scale_buffer_sparse[host_layer],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
+                elif self.layout == "page_first":
+                    raise ValueError(
+                        "Layer-sharded DSA indexer sparse HiCache backup with page_first "
+                        "layout is not supported without a per-layer LF->PF kernel."
+                    )
+                else:
+                    raise ValueError(f"Unsupported layout: {self.layout}")
+            elif io_backend == "direct":
+                if self.layout == "layer_first":
+                    transfer_kv_direct(
+                        src_layers=[device_pool.index_k_with_scale_buffer_sparse[layer_id]],
+                        dst_layers=[self.index_k_with_scale_buffer_sparse[host_layer]],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        page_size=1,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded direct DSA indexer sparse backup only supports "
+                        f"layer_first layout, got {self.layout}"
+                    )
+            else:
+                raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1980,6 +2112,62 @@ class DSAIndexerPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        if getattr(device_pool, 'two_stage_enabled', False):
+            if use_kernel:
+                if self.layout == "layer_first":
+                    transfer_kv_all_layer_mla(
+                        src_layers=self.index_k_device_ptrs_sparse,
+                        dst_layers=self.index_k_data_ptrs_sparse,
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                        num_layers=self.layer_num,
+                    )
+                elif self.layout == "page_first":
+                    if self.can_use_write_back_jit and self.staging_buffer_sparse is not None:
+                        jit_transfer_hicache_all_layer_mla_staged_lf_pf(
+                            ptr_src=self.index_k_device_ptrs_sparse,
+                            src_indices=device_page_indices,
+                            dst_indices=host_page_indices,
+                            staging=self.staging_buffer_sparse,
+                            dst=self.index_k_with_scale_buffer_sparse,
+                            page_size=1,
+                            element_size=self.indexer_page_stride_size,
+                        )
+                    else:
+                        transfer_kv_all_layer_mla_lf_pf(
+                            src_layers=self.index_k_device_ptrs_sparse,
+                            dst=self.index_k_with_scale_buffer_sparse,
+                            src_indices=device_page_indices,
+                            dst_indices=host_page_indices,
+                            item_size=self.indexer_page_stride_size,
+                            dst_layout_dim=self.indexer_layout_dim,
+                            num_layers=self.layer_num,
+                        )
+                else:
+                    raise ValueError(f"Unsupported layout: {self.layout}")
+            elif io_backend == "direct":
+                if self.layout == "layer_first":
+                    transfer_kv_direct(
+                        src_layers=device_pool.index_k_with_scale_buffer_sparse,
+                        dst_layers=self.index_k_data_refs_sparse,
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        page_size=1,
+                    )
+                elif self.layout == "page_first_direct":
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_pool.index_k_with_scale_buffer_sparse,
+                        dst_ptrs=[self.index_k_with_scale_buffer_sparse],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        page_size=1,
+                    )
+                else:
+                    raise ValueError(f"Unsupported layout: {self.layout}")
+            else:
+                raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         page_idx = int(index) // self.page_size
